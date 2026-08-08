@@ -1,0 +1,9 @@
+--requirement ../requirements.txt
+--requirement ../mate/assets/requirements.txt
+
+sphinx
+sphinx-autobuild
+sphinx-copybutton
+sphinxcontrib-tikz
+sphinx-rtd-theme
+rstcheck
