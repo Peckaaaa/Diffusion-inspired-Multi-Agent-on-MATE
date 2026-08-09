@@ -1,4 +1,4 @@
-# DIMA × MATE — Diffusion-Inspired Multi-Agent World Modeling on the Multi-Agent Tracking Environment
+# Diffusion-Inspired Multi-Agent World Modeling on the Multi-Agent Tracking Environment
 
 This repository is a **research integration**: it runs the DIMA multi-agent
 diffusion world-model algorithm on the MATE camera-tracking environment.
