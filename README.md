@@ -458,25 +458,6 @@ Diffusion world-model training on CPU is slow.
 
 ---
 
-## License
-
-This repository vendors two upstream projects that **do not share the same
-licensing terms**. Read this section before redistributing.
-
-| Component | Terms |
-|---|---|
-| [`LICENSE`](LICENSE) at the repository root | MIT — `Copyright (c) 2026 Nguyen Van Gia Bach`. Intended to cover the **integration work authored here**: `DIMA/env/mate/MATE.py`, `DIMA/configs/dreamer/mate/`, the MATE branches listed above, this README and the ignore rules. |
-| [`mate/LICENSE`](mate/LICENSE) | MIT — `Copyright (c) 2022 Xuehai Pan`. MATE keeps its own license and copyright notice; the root MIT license does not replace it. |
-| `DIMA/` | **No upstream LICENSE file.** <https://github.com/breez3young/DIMA> ships none. |
-
-⚠️ **Unresolved:** because DIMA carries no license, no redistribution or reuse
-rights are granted for it by default, and the root MIT license **cannot**
-retroactively license DIMA's code. The MATE branches added inside DIMA's own
-modules are derivative of DIMA and inherit that uncertainty.
-
-If you intend to publish or redistribute this repository, resolve the DIMA
-licensing question with its authors first.
-
 ## Acknowledgements
 
 - DIMA — <https://github.com/breez3young/DIMA>
