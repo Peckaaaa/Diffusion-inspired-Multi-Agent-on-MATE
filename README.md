@@ -275,6 +275,20 @@ repository.
 
 ## Installation
 
+A single environment runs **both** halves of this repository — DIMA and MATE. A
+separate environment for MATE is not needed.
+
+```bash
+conda create -n dima python=3.10
+conda activate dima
+pip install -r requirements.txt          # run from the repository root
+```
+
+[`requirements.txt`](requirements.txt) pins the direct dependencies of both
+projects and installs the vendored MATE source as an editable package
+(`-e ./mate`), so `import mate` resolves to `mate/` in this repository rather
+than to a copy from PyPI. It resolves cleanly under `pip install --dry-run`.
+
 The versions below are the ones this integration was **actually run with**, read
 back from the working interpreter.
 
@@ -295,18 +309,20 @@ back from the working interpreter.
 | mate | 0.1.0 (editable install of `mate/`) |
 | termcolor, ipdb | installed (no `__version__` exported) |
 
+Two caveats about that table:
+
 > ⚠️ `DIMA/environment.yml` is the **upstream DIMA** environment file. It pins
 > `python=3.10.15`, `gym==0.21.0` and `numpy==2.1.3`, which do **not** match the
 > versions above. It has not been edited, but it will **not** reproduce this
-> integration as-is. Treat the table above as the source of truth and
+> integration as-is. Treat `requirements.txt` as the source of truth and
 > `environment.yml` as upstream reference.
 
-Install MATE as an editable package so `import mate` resolves to the copy in
-this repository:
-
-```bash
-pip install -e ./mate
-```
+> ⚠️ The development machine has `opencv-python==5.0.0.93` installed next to
+> `numpy==1.26.4`. That pair is **not** resolvable by pip — opencv-python 5
+> requires `numpy>=2` on Python ≥ 3.9, while gym 0.26 requires numpy 1.x.
+> `requirements.txt` therefore pins `opencv-python==4.10.0.84`. cv2 is imported
+> at module level in `DIMA/utils.py`, but it is only *used* by the MAMuJoCo
+> visualisation helper, which the MATE path never calls.
 
 DIMA's other environment backends (SMAC, SMACv2, PettingZoo/MPE, Google
 Research Football, MAMuJoCo) are **not** required to run MATE — their imports
