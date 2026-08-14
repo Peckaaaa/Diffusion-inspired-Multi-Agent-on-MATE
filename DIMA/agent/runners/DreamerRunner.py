@@ -81,19 +81,27 @@ class DreamerServer:
 
 class DreamerRunner:
 
-    def __init__(self, env_config, learner_config, controller_config, n_workers):
+    def __init__(self, env_config, learner_config, controller_config, n_workers, resume_path=None):
         self.n_workers = n_workers
         self.learner = learner_config.create_learner()
+
+        self.resume_env_steps = 0
+        if resume_path is not None:
+            # Must resume BEFORE the DreamerServer/workers are created, otherwise the rollout
+            # workers start from randomly-initialized params instead of the checkpointed ones.
+            self.resume_env_steps = self.learner.resume(resume_path)
+
         self.server = DreamerServer(n_workers, env_config, controller_config, self.learner.params())
 
         self.save_path = Path(learner_config.RUN_DIR).parent / f"DIMA_{learner_config.map_name}_seed{learner_config.seed}.pkl"
         self.env_type = controller_config.ENV_TYPE
         
-    def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval"):
-        cur_steps, cur_episode = 0, 0
-        save_interval_steps = 0
-        last_save_steps = 0
-        last_eval_steps = 0
+    def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval",
+            resume_env_steps=0, save_resume_every_episodes=1):
+        cur_steps, cur_episode = resume_env_steps, 0
+        save_interval_steps = resume_env_steps
+        last_save_steps = resume_env_steps
+        last_eval_steps = resume_env_steps
         last_validate_steps = 0
         
         eval_win_rates = []
@@ -145,7 +153,12 @@ class DreamerRunner:
 
             self.learner.step(rollout)
 
-            ## save model
+            ## resume checkpoint: full state (model + optimizers + counters), overwritten in place so a
+            ## Kaggle session that gets cut off mid-run always leaves one loadable, near-latest file behind.
+            if cur_episode % save_resume_every_episodes == 0:
+                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps)
+
+            ## save model (lightweight, eval/rollout-only snapshot; kept for compatibility with load_pretrained)
             if (save_interval_steps - last_save_steps) > save_interval and save_mode == "interval":
                 self.learner.save(self.learner.config.RUN_DIR + f"/ckpt/model_{save_interval_steps // 1000}Ksteps.pth")
                 last_save_steps = save_interval_steps // save_interval * save_interval

@@ -235,10 +235,62 @@ class DreamerLearner:
                 'critic': {k: v.cpu() for k, v in self.critic.state_dict().items()},
                 'running_mean_std': self.state_rms.copy(),
             }
-        
+
+    def resume_state(self):
+        """Full training state for crash/interrupt resume (unlike params(), which is eval/rollout-only)."""
+        state = self.params()
+        state['state_decoder_optimizer'] = self.state_decoder_optimizer.state_dict()
+        state['denoiser_opt']            = self.denoiser_opt.state_dict()
+        state['rew_end_model_opt']       = self.rew_end_model_opt.state_dict()
+        state['actor_optimizer']         = self.actor_optimizer.state_dict()
+        state['critic_optimizer']        = self.critic_optimizer.state_dict()
+        state['train_count']    = self.train_count
+        state['step_count']     = self.step_count
+        state['cur_wandb_epoch'] = self.cur_wandb_epoch
+        state['total_samples']  = self.total_samples
+        return state
+
+    def resume(self, load_path):
+        """Resume an interrupted run: full model + optimizer + counters, training continues normally.
+        Unlike load_pretrained(), does NOT set self.evaluate / self.train_ac_only."""
+        print(f"Resuming from {load_path}")
+        # weights_only=False: this checkpoint embeds RunningMeanStd (a plain project class, not
+        # arbitrary code), which PyTorch's default safe-unpickler rejects since torch 2.6. Only
+        # ever point --resume_path at a checkpoint this same codebase wrote.
+        ckpt = torch.load(load_path, map_location=self.config.DEVICE, weights_only=False)
+
+        self.state_decoder.load_state_dict(ckpt['state_decoder'])
+        self.denoiser.load_state_dict(ckpt['denoiser'])
+        self.rew_end_model.load_state_dict(ckpt['rew_end_model'])
+        self.actor.load_state_dict(ckpt['actor'])
+        self.critic.load_state_dict(ckpt['critic'])
+        if 'running_mean_std' in ckpt:
+            self.state_rms = ckpt['running_mean_std']
+
+        if 'state_decoder_optimizer' in ckpt:
+            self.state_decoder_optimizer.load_state_dict(ckpt['state_decoder_optimizer'])
+            self.denoiser_opt.load_state_dict(ckpt['denoiser_opt'])
+            self.rew_end_model_opt.load_state_dict(ckpt['rew_end_model_opt'])
+            self.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
+            self.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+        else:
+            print("WARNING: checkpoint has no optimizer state (saved by old save()); "
+                  "resuming with freshly initialized optimizers.")
+
+        self.train_count     = ckpt.get('train_count', 0)
+        self.step_count       = ckpt.get('step_count', -1)
+        self.cur_wandb_epoch  = ckpt.get('cur_wandb_epoch', 0)
+        self.total_samples    = ckpt.get('total_samples', 0)
+
+        self.state_decoder.eval()
+        self.denoiser.eval()
+        self.rew_end_model.eval()
+
+        return ckpt.get('env_steps_done', 0)
+
     def load_pretrained(self, load_path):
         print(f"Loading from {load_path}")
-        ckpt = torch.load(load_path)
+        ckpt = torch.load(load_path, map_location=self.config.DEVICE, weights_only=False)
 
         if 'state_decoder' in ckpt:
             self.state_decoder.load_state_dict(ckpt['state_decoder'])
@@ -262,6 +314,14 @@ class DreamerLearner:
 
     def save(self, save_path):
         torch.save(self.params(), save_path)
+
+    def save_resume(self, save_path, env_steps_done):
+        """Checkpoint meant to be resumed with resume(), not just loaded for eval."""
+        state = self.resume_state()
+        state['env_steps_done'] = env_steps_done
+        tmp_path = save_path + ".tmp"
+        torch.save(state, tmp_path)
+        Path(tmp_path).replace(save_path)   # atomic: a Kaggle interrupt mid-write can't corrupt the last good ckpt
 
     def normalize_state(self, state):
         b, t, d = state.shape

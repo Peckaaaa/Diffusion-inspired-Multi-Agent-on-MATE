@@ -70,14 +70,25 @@ def parse_args():
     parser.add_argument('--load_pretrained', action='store_true', default=False)
     parser.add_argument('--load_path', type=str, default=None)
 
+    # crash/interrupt resume: full model + optimizer + counters (unlike --load_path, which is eval-only)
+    parser.add_argument('--resume_path', type=str, default=None,
+                         help='Path to a latest_resume.pth checkpoint to continue an interrupted run from.')
+    parser.add_argument('--save_interval', type=int, default=5000,
+                         help='Env steps between lightweight eval-snapshot checkpoints.')
+    parser.add_argument('--save_resume_every_episodes', type=int, default=1,
+                         help='Episodes between full resume-checkpoint overwrites (latest_resume.pth).')
+    parser.add_argument('--wandb_run_id', type=str, default=None,
+                         help='Fixed W&B run id so restarts on Kaggle append to the same run instead of forking a new one.')
+
     parser.add_argument('--use_tensorboard', action='store_true')
 
     return parser.parse_args()
 
 
-def train_dreamer(exp, n_workers): 
-    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers)
-    runner.run(exp.steps, exp.episodes, save_interval = 200000, save_mode = 'interval')
+def train_dreamer(exp, n_workers, resume_path=None, save_interval=5000, save_resume_every_episodes=1):
+    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers, resume_path=resume_path)
+    runner.run(exp.steps, exp.episodes, save_interval=save_interval, save_mode='interval',
+               resume_env_steps=runner.resume_env_steps, save_resume_every_episodes=save_resume_every_episodes)
 
 
 def get_env_info(configs, env):
@@ -333,6 +344,8 @@ if __name__ == "__main__":
         name=run_name,
         config=configs["learner_config"].to_dict(),
         notes="",
+        id=args.wandb_run_id,
+        resume="allow" if args.wandb_run_id is not None else None,
     )
 
     print("group name: ", group_name)
@@ -353,4 +366,5 @@ if __name__ == "__main__":
                      controller_config=configs["controller_config"],
                      learner_config=configs["learner_config"])
 
-    train_dreamer(exp, n_workers=args.n_workers)
+    train_dreamer(exp, n_workers=args.n_workers, resume_path=args.resume_path,
+                  save_interval=args.save_interval, save_resume_every_episodes=args.save_resume_every_episodes)
