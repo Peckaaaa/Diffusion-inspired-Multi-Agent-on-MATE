@@ -27,6 +27,8 @@ from networks.dreamer.critic import AugmentedCritic, Critic, FeatureNormedAugmen
 
 # world model related
 from agent.world_models.diffusion import Denoiser, DiffusionSampler
+from agent.world_models.diffusion.flow_matching_denoiser import FlowMatchingDenoiser, FlowMatchingDenoiserConfig
+from agent.world_models.diffusion.flow_matching_sampler import FlowMatchingSampler, FlowMatchingSamplerConfig
 from agent.world_models.vq import SimpleFSQAutoEncoder, SimpleVQAutoEncoder, StateDecoderType
 from agent.world_models.rew_end_model import RewEndModel, TransRewEndModel
 from agent.world_models.world_model_env import WorldModelEnv
@@ -91,12 +93,27 @@ class DreamerLearner:
         self.config.denoiser_cfg.inner_model.state_dim  = config.STATE_DIM
         self.config.denoiser_cfg.inner_model.action_dim = config.ACTION_SIZE
 
-        self.denoiser = Denoiser(
-            self.config.denoiser_cfg,
-            num_agents        = config.NUM_AGENTS,
-            clip_denoised     = False, # (self.env_type in [Env.STARCRAFT, Env.SMACv2]),
-            is_continuous_act = config.CONTINUOUS_ACTION).to(config.DEVICE).eval()
-        self.denoiser.setup_training(self.config.sigma_distribution)
+        world_model_type = getattr(config, 'world_model_type', 'diffusion')
+        if world_model_type == 'flow_matching':
+            cprint("Using Flow Matching Denoiser (FIMA)...", "green", attrs=["bold"])
+            fm_cfg = FlowMatchingDenoiserConfig(
+                inner_model=self.config.denoiser_cfg.inner_model,
+                perceiver=self.config.denoiser_cfg.perceiver
+            )
+            self.denoiser = FlowMatchingDenoiser(
+                fm_cfg,
+                num_agents=config.NUM_AGENTS,
+                is_continuous_act=config.CONTINUOUS_ACTION
+            ).to(config.DEVICE).eval()
+        else:
+            cprint("Using Diffusion Denoiser...", "cyan", attrs=["bold"])
+            self.denoiser = Denoiser(
+                self.config.denoiser_cfg,
+                num_agents=config.NUM_AGENTS,
+                clip_denoised=False,
+                is_continuous_act=config.CONTINUOUS_ACTION
+            ).to(config.DEVICE).eval()
+            self.denoiser.setup_training(self.config.sigma_distribution)
 
         # self.global_state_normalizer = ValueNorm(config.STATE_DIM, device=config.DEVICE)
         self.state_rms = RunningMeanStd(shape=(config.STATE_DIM))
@@ -210,7 +227,12 @@ class DreamerLearner:
     def init_optimizers(self):
         self.state_decoder_optimizer = torch.optim.AdamW(self.state_decoder.parameters(), lr=3e-4)
 
-        self.denoiser_opt = configure_opt(self.denoiser, **self.config.denoiser_opt_cfg)
+        world_model_type = getattr(self.config, 'world_model_type', 'diffusion')
+        if world_model_type == 'flow_matching':
+            fm_opt_cfg = getattr(self.config, 'fm_opt_cfg', {'lr': getattr(self.config, 'FM_LR', 1e-4), 'weight_decay': 0.01, 'eps': 1e-08})
+            self.denoiser_opt = configure_opt(self.denoiser, **fm_opt_cfg)
+        else:
+            self.denoiser_opt = configure_opt(self.denoiser, **self.config.denoiser_opt_cfg)
         self.denoiser_lr_sched = get_lr_sched(self.denoiser_opt, self.config.denoiser_lr_warmup_steps)
 
         if self.config.rew_end_model_type == 'rnn':
@@ -861,7 +883,15 @@ class DreamerLearner:
         horizon = self.config.horizon
         num_steps_conditioning = self.config.denoiser_cfg.inner_model.num_steps_conditioning
         
-        sampler = DiffusionSampler(self.denoiser, self.config.worldmodel_env_cfg.diffusion_sampler)
+        world_model_type = getattr(self.config, 'world_model_type', 'diffusion')
+        if world_model_type == 'flow_matching':
+            fm_sampler_cfg = FlowMatchingSamplerConfig(
+                num_steps_sampling=getattr(self.config, 'fm_num_sampling_steps', self.config.worldmodel_env_cfg.diffusion_sampler.num_steps_denoising),
+                agent_order=self.config.worldmodel_env_cfg.diffusion_sampler.agent_order
+            )
+            sampler = FlowMatchingSampler(self.denoiser, fm_sampler_cfg)
+        else:
+            sampler = DiffusionSampler(self.denoiser, self.config.worldmodel_env_cfg.diffusion_sampler)
         
         import random
         for _ in range(20):

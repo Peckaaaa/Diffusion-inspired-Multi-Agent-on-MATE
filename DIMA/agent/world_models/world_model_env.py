@@ -11,6 +11,8 @@ import torch.distributions as td
 
 from agent.coroutines import coroutine
 from agent.world_models.diffusion import Denoiser, DiffusionSampler, DiffusionSamplerConfig
+from agent.world_models.diffusion.flow_matching_denoiser import FlowMatchingDenoiser
+from agent.world_models.diffusion.flow_matching_sampler import FlowMatchingSampler, FlowMatchingSamplerConfig
 from agent.world_models.rew_end_model import TransRewEndModel, RewEndModel
 from agent.world_models.vq import SimpleVQAutoEncoder, SimpleFSQAutoEncoder, StateDecoderType
 
@@ -35,7 +37,7 @@ class WorldModelEnv:
         self,
         running_mean_std,
         state_decoder: Union[SimpleFSQAutoEncoder, SimpleVQAutoEncoder],
-        denoiser: Denoiser,
+        denoiser: Union[Denoiser, FlowMatchingDenoiser],
         rew_end_model: TransRewEndModel,
         dataset: MultiAgentEpisodesDataset,
         num_envs: int,
@@ -50,7 +52,15 @@ class WorldModelEnv:
     ) -> None:
         self.running_mean_std = running_mean_std
 
-        self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
+        if isinstance(denoiser, FlowMatchingDenoiser):
+            fm_sampler_cfg = FlowMatchingSamplerConfig(
+                num_steps_sampling=cfg.diffusion_sampler.num_steps_denoising,
+                agent_order=cfg.diffusion_sampler.agent_order
+            )
+            self.sampler = FlowMatchingSampler(denoiser, fm_sampler_cfg)
+        else:
+            self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
+
         self.is_continuous_act = denoiser.is_continuous_act
 
         self.pred_av_action = rew_end_model.pred_av_action

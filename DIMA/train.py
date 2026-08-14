@@ -57,6 +57,8 @@ def parse_args():
     parser.add_argument('--mate_levels', type=int, default=5, help='DiscreteCamera levels; action size is levels^2')
     parser.add_argument('--mate_episode_limit', type=int, default=200, help='Overrides max_episode_steps in the MATE scenario')
 
+    parser.add_argument('--world_model_type', type=str, default='diffusion', choices=['diffusion', 'flow_matching'], help='World model type: diffusion or flow_matching (FIMA)')
+
     parser.add_argument('--n_workers', type=int, default=2, help='Number of workers')
     parser.add_argument('--seed', type=int, default=1, help='Number of workers')
     parser.add_argument('--steps', type=int, default=1e6, help='Number of workers')
@@ -220,6 +222,9 @@ if __name__ == "__main__":
 
     configs["learner_config"].policy_class    = args.policy_class
     configs["controller_config"].policy_class = args.policy_class
+
+    configs["learner_config"].world_model_type    = getattr(args, 'world_model_type', 'diffusion')
+    configs["controller_config"].world_model_type = getattr(args, 'world_model_type', 'diffusion')
 
     if args.policy_class == 'gaussian':
         configs['learner_config'].ENTROPY = 0.001

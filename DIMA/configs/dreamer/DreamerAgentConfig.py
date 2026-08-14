@@ -62,6 +62,11 @@ class DreamerConfig(Config):
 
         self.policy_class = 'discrete'
 
+        # World model backend type: 'diffusion' (default) or 'flow_matching' (FIMA)
+        self.world_model_type = 'diffusion'
+        self.fm_lr = 1e-4
+        self.fm_num_sampling_steps = 4
+
         ## denoiser params
         self.cond_channels = 256
 

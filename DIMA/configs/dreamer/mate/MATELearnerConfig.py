@@ -87,6 +87,14 @@ class MATEDreamerLearnerConfig(MATEDreamerConfig):
         }
         self.denoiser_lr_warmup_steps = 100
 
+        ### Flow Matching (FIMA) learning params
+        self.FM_LR = 0.0001
+        self.fm_opt_cfg = {
+            'lr': 0.0001,
+            'weight_decay': 0.01,
+            'eps': 1e-08,
+        }
+
         ### rew_end_model learning params
         self.remodel_steps_first_epoch = 60
         self.remodel_steps = 60
