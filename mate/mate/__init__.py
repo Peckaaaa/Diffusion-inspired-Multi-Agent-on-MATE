@@ -2,6 +2,18 @@
 
 import os
 
+import numpy as _np
+
+# numpy 2 removed the `np.bool8` alias; MATE uses it as a dtype in ~50 places
+# (environment.py, constants.py, entities.py, agents/*).  It was only ever an
+# alias for np.bool_, so restoring it keeps MATE working on numpy 2.x without
+# pinning numpy 1.x -- which on images that ship numpy 2 (Kaggle, Colab) means
+# downgrading numpy under packages compiled against 2.x and hitting
+# "numpy.dtype size changed" ABI errors.
+# Must run before the submodule imports below, which reference np.bool8.
+if not hasattr(_np, 'bool8'):
+    _np.bool8 = _np.bool_
+
 import gym
 
 from mate import agents, constants, environment, utils, wrappers

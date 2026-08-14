@@ -31,7 +31,13 @@
 # Shared core -- required by both DIMA and MATE
 # -----------------------------------------------------------------------------
 gym==0.26.2                 # NOT gymnasium: MATE 0.1.0 is written against gym
-numpy==1.26.4               # numpy 2.x breaks gym 0.26
+# numpy is deliberately NOT pinned.  MATE's only numpy-1-only API was the
+# `np.bool8` alias, which mate/__init__.py now restores on numpy 2.x, and
+# gym 0.26.2 itself was verified working under numpy 2.2.6.  Pinning numpy 1.x
+# on an image that ships numpy 2 (Kaggle, Colab) downgrades it underneath
+# packages compiled against 2.x and produces
+# "ValueError: numpy.dtype size changed" at import time.
+numpy
 tqdm==4.70.0
 PyYAML==6.0.3
 
@@ -43,14 +49,16 @@ torchvision==0.28.0         # torchvision.ops.focal_loss, used by rew_end_model
 einops==0.8.2
 ray==2.56.1                 # parallel rollout / evaluation workers
 wandb==0.28.1               # imported unconditionally; `--mode disabled` still works
-tensorboard==2.21.0         # optional logger, but tb_logger imports it at module level
+tensorboard                 # optional logger, but tb_logger imports it at module level
+                            # (unpinned: pinning 2.21 conflicts with the tensorflow
+                            #  preinstalled on Kaggle, which wants tensorboard~=2.20)
 # cv2 is imported at module level in DIMA/utils.py (line 563), so it is required
 # even though it is only used by the MAMuJoCo visualisation helper.
-# NOT 5.x: opencv-python 5 requires numpy>=2 on Python>=3.9, which contradicts
-# the numpy 1.26.4 that gym 0.26 needs.  (The development machine happens to
-# have 5.0.0.93 installed alongside numpy 1.26.4 -- a combination pip refuses to
-# resolve, so this file pins the last 4.x instead.)
-opencv-python==4.10.0.84
+# Unpinned now that numpy is unpinned: the old `==4.10.0.84` pin existed solely
+# because opencv 5.x requires numpy>=2, which contradicted the numpy 1.26.4 that
+# gym 0.26 used to need.  That constraint is gone (see the numpy note above), so
+# any opencv the host already ships is fine.
+opencv-python
 psutil==7.2.2               # replay-buffer RAM accounting in DIMA/dataset.py
 termcolor==3.3.0
 ipdb==0.13.13               # imported at module level in several DIMA files
