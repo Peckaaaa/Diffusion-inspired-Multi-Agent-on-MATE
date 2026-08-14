@@ -1,4 +1,5 @@
 import ray
+import time
 import wandb
 from copy import deepcopy
 
@@ -97,12 +98,13 @@ class DreamerRunner:
         self.env_type = controller_config.ENV_TYPE
         
     def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval",
-            resume_env_steps=0, save_resume_every_episodes=1):
+            resume_env_steps=0, save_resume_every_episodes=1, max_seconds=None):
         cur_steps, cur_episode = resume_env_steps, 0
         save_interval_steps = resume_env_steps
         last_save_steps = resume_env_steps
         last_eval_steps = resume_env_steps
         last_validate_steps = 0
+        wall_start = time.time()
         
         eval_win_rates = []
         eval_ret_list  = []
@@ -201,7 +203,19 @@ class DreamerRunner:
                 self.learner.save(self.learner.config.RUN_DIR + f"/ckpt/model_final.pth")
                 # self.learner.visualize_attention_map(-1, save_mode='final')
                 break
-            
+
+            # Stop cleanly before an interruptible host (Kaggle et al.) kills the session:
+            # exiting under our own control guarantees the notebook finishes normally and its
+            # output -- including the resume checkpoint -- is committed.
+            if max_seconds is not None and (time.time() - wall_start) >= max_seconds:
+                elapsed_h = (time.time() - wall_start) / 3600
+                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps)
+                print(f"\n=== Time budget reached ({elapsed_h:.2f}h >= {max_seconds/3600:.2f}h). "
+                      f"Stopping cleanly at {cur_steps} env steps. ===")
+                print("=== Resume the next session with: "
+                      "--resume_path .../ckpt/latest_resume.pth ===")
+                break
+
             self.server.append(info['idx'], self.learner.params())
 
         # store log data locally
