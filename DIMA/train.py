@@ -92,7 +92,9 @@ def train_dreamer(exp, n_workers, resume_path=None, save_interval=5000, save_res
                   max_hours=None):
     runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers, resume_path=resume_path)
     runner.run(exp.steps, exp.episodes, save_interval=save_interval, save_mode='interval',
-               resume_env_steps=runner.resume_env_steps, save_resume_every_episodes=save_resume_every_episodes,
+               resume_env_steps=runner.resume_env_steps,
+               resume_episode_count=runner.resume_episode_count,
+               save_resume_every_episodes=save_resume_every_episodes,
                max_seconds=(max_hours * 3600 if max_hours is not None else None))
 
 

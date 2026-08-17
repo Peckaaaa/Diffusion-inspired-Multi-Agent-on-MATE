@@ -1,4 +1,5 @@
 import sys
+import random
 from copy import deepcopy
 from pathlib import Path
 from collections import defaultdict
@@ -38,6 +39,27 @@ from utils import CommonTools, configure_opt, get_lr_sched, count_parameters, wa
 from episode import SC2Episode, MpeEpisode, GRFEpisode, MamujocoEpisode
 from dataset import MultiAgentEpisodesDataset, convert_to_batch
 from tb_logger import LOGGER
+
+
+def _optim_state_differs(a, b):
+    """Compare two optimizer state_dicts. Adam moments live in nested dicts of tensors,
+    so `a == b` raises on tensor comparison instead of returning a bool."""
+    if a.get('param_groups') != b.get('param_groups'):
+        return True
+    sa, sb = a.get('state', {}), b.get('state', {})
+    if set(sa.keys()) != set(sb.keys()):
+        return True
+    for k in sa:
+        if set(sa[k].keys()) != set(sb[k].keys()):
+            return True
+        for kk, va in sa[k].items():
+            vb = sb[k][kk]
+            if torch.is_tensor(va):
+                if not torch.equal(va.cpu(), vb.cpu()):
+                    return True
+            elif va != vb:
+                return True
+    return False
 
 import wandb
 import ipdb
@@ -236,57 +258,230 @@ class DreamerLearner:
                 'running_mean_std': self.state_rms.copy(),
             }
 
+    # --- crash/interrupt resume -------------------------------------------------
+    # params() above is the eval/rollout payload broadcast to Ray workers; it is NOT
+    # enough to resume training. Everything the training loop mutates has to round-trip,
+    # or the run silently restarts pieces of itself (the symptom that showed up as
+    # `Value` jumping back to ~1.2 after every session boundary: value_normalizer was
+    # being re-initialised, so the critic's normalised target changed scale mid-run).
+
+    # Modules whose state_dict() fully describes them (incl. FSQ/VQ codebook buffers).
+    _RESUME_MODULES = ('state_decoder', 'denoiser', 'rew_end_model', 'actor', 'critic',
+                       'old_critic', 'value_normalizer')
+    _RESUME_OPTIMS = ('state_decoder_optimizer', 'denoiser_opt', 'rew_end_model_opt',
+                      'actor_optimizer', 'critic_optimizer')
+    _RESUME_SCHEDS = ('denoiser_lr_sched', 'rew_end_model_lr_sched')
+    _RESUME_SCALARS = ('train_count', 'step_count', 'cur_wandb_epoch', 'total_samples',
+                       'cur_update', 'accum_samples', 'n_agents', 'entropy')
+
+    @staticmethod
+    def _rms_to_dict(rms):
+        # Store as plain arrays rather than pickling RunningMeanStd itself: a pickled
+        # class instance forces torch.load(weights_only=False) and breaks if the class moves.
+        return {'mean': np.asarray(rms.mean), 'var': np.asarray(rms.var), 'count': float(rms.count)}
+
+    def _rms_from(self, obj):
+        rms = RunningMeanStd(shape=(self.config.STATE_DIM,))
+        if isinstance(obj, dict):
+            rms.mean, rms.var, rms.count = obj['mean'], obj['var'], obj['count']
+        else:                       # legacy checkpoints stored the object itself
+            rms.mean, rms.var, rms.count = obj.mean, obj.var, obj.count
+        return rms
+
     def resume_state(self):
-        """Full training state for crash/interrupt resume (unlike params(), which is eval/rollout-only)."""
-        state = self.params()
-        state['state_decoder_optimizer'] = self.state_decoder_optimizer.state_dict()
-        state['denoiser_opt']            = self.denoiser_opt.state_dict()
-        state['rew_end_model_opt']       = self.rew_end_model_opt.state_dict()
-        state['actor_optimizer']         = self.actor_optimizer.state_dict()
-        state['critic_optimizer']        = self.critic_optimizer.state_dict()
-        state['train_count']    = self.train_count
-        state['step_count']     = self.step_count
-        state['cur_wandb_epoch'] = self.cur_wandb_epoch
-        state['total_samples']  = self.total_samples
+        """Everything needed to continue training exactly where it stopped."""
+        state = {'format': 2}
+        for name in self._RESUME_MODULES:
+            mod = getattr(self, name, None)
+            if mod is not None:
+                state[name] = {k: v.cpu() for k, v in mod.state_dict().items()}
+        for name in self._RESUME_OPTIMS:
+            state[name] = getattr(self, name).state_dict()
+        for name in self._RESUME_SCHEDS:
+            sched = getattr(self, name, None)
+            if sched is not None:
+                state[name] = sched.state_dict()
+        for name in self._RESUME_SCALARS:
+            state[name] = getattr(self, name)
+        state['running_mean_std'] = self._rms_to_dict(self.state_rms)
+        state['num_batch_train'] = self.num_batch_train.state_dict()
+        # RNG: without these, every resume replays the same exploration noise from a
+        # fresh seed instead of continuing the stream.
+        state['rng'] = {'torch': torch.get_rng_state(),
+                        'numpy': np.random.get_state(),
+                        'python': random.getstate()}
+        if torch.cuda.is_available():
+            state['rng']['cuda'] = torch.cuda.get_rng_state_all()
         return state
 
     def resume(self, load_path):
-        """Resume an interrupted run: full model + optimizer + counters, training continues normally.
-        Unlike load_pretrained(), does NOT set self.evaluate / self.train_ac_only."""
+        """Resume an interrupted run. Unlike load_pretrained(), does NOT set
+        self.evaluate / self.train_ac_only, so training continues normally."""
         print(f"Resuming from {load_path}")
-        # weights_only=False: this checkpoint embeds RunningMeanStd (a plain project class, not
-        # arbitrary code), which PyTorch's default safe-unpickler rejects since torch 2.6. Only
-        # ever point --resume_path at a checkpoint this same codebase wrote.
+        # weights_only=False: format-1 checkpoints pickled a RunningMeanStd instance, which
+        # torch>=2.6's safe unpickler rejects. Only ever point --resume_path at a checkpoint
+        # this same codebase wrote. Format 2 no longer pickles any custom class.
         ckpt = torch.load(load_path, map_location=self.config.DEVICE, weights_only=False)
+        fmt = ckpt.get('format', 1)
+        missing = []
 
-        self.state_decoder.load_state_dict(ckpt['state_decoder'])
-        self.denoiser.load_state_dict(ckpt['denoiser'])
-        self.rew_end_model.load_state_dict(ckpt['rew_end_model'])
-        self.actor.load_state_dict(ckpt['actor'])
-        self.critic.load_state_dict(ckpt['critic'])
+        for name in self._RESUME_MODULES:
+            mod = getattr(self, name, None)
+            if mod is None:
+                continue
+            if name in ckpt:
+                mod.load_state_dict(ckpt[name])
+            else:
+                missing.append(name)
+        for name in self._RESUME_OPTIMS + self._RESUME_SCHEDS:
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            if name in ckpt:
+                obj.load_state_dict(ckpt[name])
+            else:
+                missing.append(name)
+        for name in self._RESUME_SCALARS:
+            if name in ckpt:
+                setattr(self, name, ckpt[name])
+            else:
+                missing.append(name)
+
         if 'running_mean_std' in ckpt:
-            self.state_rms = ckpt['running_mean_std']
-
-        if 'state_decoder_optimizer' in ckpt:
-            self.state_decoder_optimizer.load_state_dict(ckpt['state_decoder_optimizer'])
-            self.denoiser_opt.load_state_dict(ckpt['denoiser_opt'])
-            self.rew_end_model_opt.load_state_dict(ckpt['rew_end_model_opt'])
-            self.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
-            self.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+            self.state_rms = self._rms_from(ckpt['running_mean_std'])
         else:
-            print("WARNING: checkpoint has no optimizer state (saved by old save()); "
-                  "resuming with freshly initialized optimizers.")
+            missing.append('running_mean_std')
+        if 'num_batch_train' in ckpt:
+            self.num_batch_train.load_state_dict(ckpt['num_batch_train'])
+        else:
+            missing.append('num_batch_train')
 
-        self.train_count     = ckpt.get('train_count', 0)
-        self.step_count       = ckpt.get('step_count', -1)
-        self.cur_wandb_epoch  = ckpt.get('cur_wandb_epoch', 0)
-        self.total_samples    = ckpt.get('total_samples', 0)
+        rng = ckpt.get('rng')
+        if rng is not None:
+            torch.set_rng_state(rng['torch'].cpu() if torch.is_tensor(rng['torch']) else rng['torch'])
+            np.random.set_state(rng['numpy'])
+            random.setstate(rng['python'])
+            if 'cuda' in rng and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_rng_state_all([s.cpu() for s in rng['cuda']])
+                except (RuntimeError, ValueError) as e:
+                    print(f"  (bỏ qua CUDA RNG: {e})")   # different GPU count than when saved
+        else:
+            missing.append('rng')
+
+        # old_critic is a deepcopy target refreshed every TARGET_UPDATE; if the checkpoint
+        # predates it being saved, re-derive it from the critic rather than leaving it random.
+        if 'old_critic' in missing:
+            self.old_critic = deepcopy(self.critic)
+
+        if missing:
+            print(f"WARNING: checkpoint format {fmt} is missing {len(missing)} field(s); "
+                  f"these were re-initialised: {', '.join(missing)}")
 
         self.state_decoder.eval()
         self.denoiser.eval()
         self.rew_end_model.eval()
 
-        return ckpt.get('env_steps_done', 0)
+        return ckpt.get('env_steps_done', 0), ckpt.get('episode_count', 0)
+
+    def verify_resume(self, path=None):
+        """Save -> mutate everything -> load -> assert the state came back bit-identical.
+
+        Mutating in between is the point: comparing a fresh save against an untouched
+        learner would pass even if load_state_dict were a no-op."""
+        import tempfile, os as _os
+        path = path or _os.path.join(tempfile.mkdtemp(), 'verify.pth')
+
+        def snapshot():
+            snap = {'modules': {}, 'optims': {}, 'scheds': {}, 'scalars': {}}
+            for n in self._RESUME_MODULES:
+                m = getattr(self, n, None)
+                if m is not None:
+                    snap['modules'][n] = {k: v.detach().clone() for k, v in m.state_dict().items()}
+            for n in self._RESUME_OPTIMS:
+                snap['optims'][n] = deepcopy(getattr(self, n).state_dict())
+            for n in self._RESUME_SCHEDS:
+                s = getattr(self, n, None)
+                if s is not None:
+                    snap['scheds'][n] = deepcopy(s.state_dict())
+            for n in self._RESUME_SCALARS:
+                snap['scalars'][n] = getattr(self, n)
+            snap['rms'] = self._rms_to_dict(self.state_rms)
+            snap['nbt'] = deepcopy(self.num_batch_train.state_dict())
+            snap['rng_torch'] = torch.get_rng_state().clone()
+            return snap
+
+        before = snapshot()
+        self.save_resume(path, env_steps_done=123456, episode_count=789)
+
+        # --- mutate every channel we claim to restore ---
+        with torch.no_grad():
+            for n in self._RESUME_MODULES:
+                m = getattr(self, n, None)
+                if m is None:
+                    continue
+                for p in m.state_dict().values():
+                    if p.dtype.is_floating_point:
+                        p.add_(torch.randn_like(p))
+        for n in self._RESUME_OPTIMS:                       # dirty the Adam moments
+            opt = getattr(self, n)
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if p.requires_grad:
+                        p.grad = torch.randn_like(p)
+            opt.step(); opt.zero_grad()
+        for n in self._RESUME_SCHEDS:
+            s = getattr(self, n, None)
+            if s is not None:
+                s.step()
+        for n in self._RESUME_SCALARS:
+            setattr(self, n, getattr(self, n) + 1000)
+        self.state_rms.mean = self.state_rms.mean + 7.0
+        self.state_rms.count += 999
+        self.num_batch_train.set('denoiser', 424242)
+        torch.randn(1000)                                   # advance the RNG stream
+
+        env_steps, episode_count = self.resume(path)
+
+        # --- compare ---
+        errs = []
+        for n, sd in before['modules'].items():
+            cur = getattr(self, n).state_dict()
+            for k, v in sd.items():
+                if not torch.equal(cur[k].cpu(), v.cpu()):
+                    errs.append(f"module {n}.{k}")
+        for n, sd in before['optims'].items():
+            if _optim_state_differs(getattr(self, n).state_dict(), sd):
+                errs.append(f"optimizer {n}")
+        for n, sd in before['scheds'].items():
+            if getattr(self, n).state_dict() != sd:
+                errs.append(f"lr_sched {n}")
+        for n, v in before['scalars'].items():
+            if getattr(self, n) != v:
+                errs.append(f"scalar {n} ({getattr(self, n)} != {v})")
+        rms = self._rms_to_dict(self.state_rms)
+        if not (np.allclose(rms['mean'], before['rms']['mean'])
+                and np.allclose(rms['var'], before['rms']['var'])
+                and rms['count'] == before['rms']['count']):
+            errs.append('running_mean_std')
+        if self.num_batch_train.state_dict() != before['nbt']:
+            errs.append('num_batch_train')
+        if not torch.equal(torch.get_rng_state(), before['rng_torch']):
+            errs.append('torch RNG state')
+        if env_steps != 123456 or episode_count != 789:
+            errs.append(f'env_steps/episode_count ({env_steps}, {episode_count})')
+
+        n_tensors = sum(len(sd) for sd in before['modules'].values())
+        if errs:
+            print(f"verify_resume: FAIL — {len(errs)} mismatch(es):")
+            for e in errs[:20]:
+                print(f"    {e}")
+            raise AssertionError(f"resume() did not restore: {errs[:5]}")
+        print(f"verify_resume: OK — {n_tensors} tensors across "
+              f"{len(before['modules'])} modules, {len(before['optims'])} optimizers, "
+              f"{len(before['scheds'])} lr_scheds, {len(before['scalars'])} scalars, "
+              f"running_mean_std, num_batch_train, RNG, env_steps/episode_count")
+        return True
 
     def load_pretrained(self, load_path):
         print(f"Loading from {load_path}")
@@ -315,10 +510,11 @@ class DreamerLearner:
     def save(self, save_path):
         torch.save(self.params(), save_path)
 
-    def save_resume(self, save_path, env_steps_done):
+    def save_resume(self, save_path, env_steps_done, episode_count=0):
         """Checkpoint meant to be resumed with resume(), not just loaded for eval."""
         state = self.resume_state()
         state['env_steps_done'] = env_steps_done
+        state['episode_count'] = episode_count
         tmp_path = save_path + ".tmp"
         torch.save(state, tmp_path)
         Path(tmp_path).replace(save_path)   # atomic: a Kaggle interrupt mid-write can't corrupt the last good ckpt

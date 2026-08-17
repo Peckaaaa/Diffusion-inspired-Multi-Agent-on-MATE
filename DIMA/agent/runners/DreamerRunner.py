@@ -87,10 +87,11 @@ class DreamerRunner:
         self.learner = learner_config.create_learner()
 
         self.resume_env_steps = 0
+        self.resume_episode_count = 0
         if resume_path is not None:
             # Must resume BEFORE the DreamerServer/workers are created, otherwise the rollout
             # workers start from randomly-initialized params instead of the checkpointed ones.
-            self.resume_env_steps = self.learner.resume(resume_path)
+            self.resume_env_steps, self.resume_episode_count = self.learner.resume(resume_path)
 
         self.server = DreamerServer(n_workers, env_config, controller_config, self.learner.params())
 
@@ -98,8 +99,8 @@ class DreamerRunner:
         self.env_type = controller_config.ENV_TYPE
         
     def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval",
-            resume_env_steps=0, save_resume_every_episodes=1, max_seconds=None):
-        cur_steps, cur_episode = resume_env_steps, 0
+            resume_env_steps=0, resume_episode_count=0, save_resume_every_episodes=1, max_seconds=None):
+        cur_steps, cur_episode = resume_env_steps, resume_episode_count
         save_interval_steps = resume_env_steps
         last_save_steps = resume_env_steps
         last_eval_steps = resume_env_steps
@@ -158,7 +159,7 @@ class DreamerRunner:
             ## resume checkpoint: full state (model + optimizers + counters), overwritten in place so a
             ## Kaggle session that gets cut off mid-run always leaves one loadable, near-latest file behind.
             if cur_episode % save_resume_every_episodes == 0:
-                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps)
+                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps, cur_episode)
 
             ## save model (lightweight, eval/rollout-only snapshot; kept for compatibility with load_pretrained)
             if (save_interval_steps - last_save_steps) > save_interval and save_mode == "interval":
@@ -209,7 +210,7 @@ class DreamerRunner:
             # output -- including the resume checkpoint -- is committed.
             if max_seconds is not None and (time.time() - wall_start) >= max_seconds:
                 elapsed_h = (time.time() - wall_start) / 3600
-                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps)
+                self.learner.save_resume(self.learner.config.RUN_DIR + "/ckpt/latest_resume.pth", cur_steps, cur_episode)
                 print(f"\n=== Time budget reached ({elapsed_h:.2f}h >= {max_seconds/3600:.2f}h). "
                       f"Stopping cleanly at {cur_steps} env steps. ===")
                 print("=== Resume the next session with: "
