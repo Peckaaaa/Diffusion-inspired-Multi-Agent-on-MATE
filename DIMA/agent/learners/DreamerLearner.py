@@ -303,6 +303,10 @@ class DreamerLearner:
                 state[name] = sched.state_dict()
         for name in self._RESUME_SCALARS:
             state[name] = getattr(self, name)
+        # Recorded so resume() can detect a GAMMA change: the critic predicts r/(1-gamma),
+        # so resuming a critic trained under a different gamma silently feeds the actor a
+        # value function on the wrong scale.
+        state['gamma'] = self.config.GAMMA
         state['running_mean_std'] = self._rms_to_dict(self.state_rms)
         state['num_batch_train'] = self.num_batch_train.state_dict()
         # RNG: without these, every resume replays the same exploration noise from a
@@ -332,9 +336,16 @@ class DreamerLearner:
         fmt = ckpt.get('format', 1)
         missing = []
 
+        ckpt_gamma = ckpt.get('gamma')
+        if ckpt_gamma is not None and ckpt_gamma != self.config.GAMMA and not reset_critic:
+            print(f"  GAMMA doi {ckpt_gamma} -> {self.config.GAMMA}: critic du doan r/(1-gamma), "
+                  f"thang gia tri doi {(1-ckpt_gamma)/(1-self.config.GAMMA):.1f}x. "
+                  f"Tu dong bat reset_critic.")
+            reset_critic = True
+
         skip = {'critic', 'old_critic', 'value_normalizer', 'critic_optimizer'} if reset_critic else set()
         if reset_critic:
-            print("  --reset_critic: giu world model, khoi tao lai critic + value_normalizer")
+            print("  reset_critic: giu world model, khoi tao lai critic + value_normalizer")
 
         for name in self._RESUME_MODULES:
             mod = getattr(self, name, None)
