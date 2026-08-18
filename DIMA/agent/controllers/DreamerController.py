@@ -127,8 +127,18 @@ class DreamerController:
             probs = F.softmax(pi, -1)
             ent = -((probs * torch.log(probs + 1e-6)).sum(-1))            
             
-            action_dist = OneHotCategorical(logits=pi)
-            action = action_dist.sample()
+            if self.use_deterministic_action:
+                # Greedy. Until now the discrete branch ignored use_deterministic_action
+                # entirely (it is only read in the continuous branch above), so the eval
+                # workers -- which DreamerRunner explicitly configures with
+                # determinisitc=True -- were sampling exactly like the training workers.
+                # With entropy ~2.85 of a ln(25)=3.22 maximum the policy spreads its mass
+                # over ~exp(2.85)=17 of 25 actions, so sampling discards most of whatever
+                # preference it had learned.
+                action = F.one_hot(pi.argmax(-1), pi.size(-1)).to(pi.dtype)
+            else:
+                action_dist = OneHotCategorical(logits=pi)
+                action = action_dist.sample()
             
             # epsilon exploration
             if random.random() < self.eps:

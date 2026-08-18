@@ -100,18 +100,50 @@ def calculate_next_reward(model, actions, states):
     return calculate_reward(model, imag_rew_feat)
 
 
+@torch.no_grad()
+def _ppo_diagnostics(log_rho, rho, policy_loss, entropy_term, clip_param):
+    """The three numbers that tell you whether PPO is doing anything.
+
+    approx_kl : Schulman's k3 estimator, mean(rho - 1 - log rho). Unbiased, always >= 0,
+                far lower variance than mean(-log rho). ~0 means the policy is not moving.
+    clip_frac : share of samples whose ratio left the trust region. 0 means the updates
+                are too small to ever hit the boundary; >0.3 means they are too large.
+    ratio_*   : raw importance weights, for sanity-checking the two above.
+    """
+    log_rho = log_rho.detach()
+    rho = rho.detach()
+    return {
+        'Policy/approx_kl':   (rho - 1.0 - log_rho).mean(),
+        'Policy/clip_frac':   ((rho - 1.0).abs() > clip_param).float().mean(),
+        'Policy/ratio_mean':  rho.mean(),
+        'Policy/ratio_std':   rho.std(),
+        'Policy/policy_loss': policy_loss.detach().mean(),
+        'Policy/entropy_term': entropy_term.detach().mean(),
+    }
+
+
 def actor_loss(imag_states, actions, av_actions, old_policy, advantage, actor, ent_weight, clip_param):
+    """Returns (loss, diagnostics).
+
+    The loss value itself is uninformative: `advantage` arrives already normalised to
+    zero mean, and on the first PPO epoch rho == 1 exactly (old_policy IS the policy
+    being updated), so the policy term is -mean(A) == 0 by construction and only the
+    minibatch sampling noise makes it wobble. The diagnostics are what actually say
+    whether PPO is moving the policy.
+    """
     _, new_policy = actor(imag_states)
     if av_actions is not None:
         new_policy[av_actions == 0] = -1e10
     actions = actions.argmax(-1, keepdim=True)
-    rho = (F.log_softmax(new_policy, dim=-1).gather(2, actions) -
-           F.log_softmax(old_policy, dim=-1).gather(2, actions)).exp()
+    log_rho = (F.log_softmax(new_policy, dim=-1).gather(2, actions) -
+               F.log_softmax(old_policy, dim=-1).gather(2, actions))
+    rho = log_rho.exp()
     ppo_loss, ent_loss = calculate_ppo_loss(new_policy, rho, advantage, clip_param)
     if np.random.randint(10) == 9:
         wandb.log({'Policy/Entropy': ent_loss.mean(), 'Policy/Mean action': actions.float().mean()})
         # print(f'in function actor loss, entropy is {ent_loss.detach().mean().item()}')
-    return (ppo_loss + ent_loss.unsqueeze(-1) * ent_weight).mean()
+    loss = (ppo_loss + ent_loss.unsqueeze(-1) * ent_weight).mean()
+    return loss, _ppo_diagnostics(log_rho, rho, ppo_loss, ent_loss * ent_weight, clip_param)
 
 ## update
 def continuous_actor_loss(imag_states, actions, av_actions, old_log_probs, advantage, actor, ent_weight, clip_param):
@@ -127,13 +159,15 @@ def continuous_actor_loss(imag_states, actions, av_actions, old_log_probs, advan
 
     policy_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
     actor_loss = policy_loss - dist_entropy * ent_weight
+    _diag = _ppo_diagnostics(torch.log(imp_weights.clamp_min(1e-12)), imp_weights,
+                             policy_loss, -dist_entropy * ent_weight, clip_param)
     # (policy_loss - dist_entropy * ent_weight).backward()
     if np.random.randint(10) == 9:
         wandb.log({'Policy/Entropy': dist_entropy.detach().item(), 'Policy/Mean action': actions.detach().float().mean().item()})
         LOGGER.log_scalar_wo_step('Policy/Entropy', dist_entropy.detach().item())
         LOGGER.log_scalar_wo_step('Policy/Mean action', actions.detach().float().mean().item())
         # print(f'in function continuous actor loss, entropy is {dist_entropy.detach().item()}')
-    return actor_loss
+    return actor_loss, _diag
 
 def value_loss(critic, imag_feat, targets):
     value_pred = critic(imag_feat)

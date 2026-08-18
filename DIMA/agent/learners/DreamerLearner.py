@@ -758,6 +758,24 @@ class DreamerLearner:
             for k, v in d.items():
                 LOGGER.log_scalar(k, v, self.cur_wandb_epoch)
 
+        # Re-log the PPO health metrics against env steps as well. Everything above is on
+        # the cur_wandb_epoch axis, which cannot be lined up with coverage_rate/eval_* (those
+        # are logged against env steps by the runner) -- and lining them up is the whole
+        # point of these metrics. total_samples counts the same env steps the runner counts.
+        _watch = {}
+        for d in total_to_log:
+            for k, v in d.items():
+                short = k.rsplit('/train/', 1)[-1]
+                if short.startswith(('Adv/', 'Policy/')) or short in (
+                        'Returns', 'Value', 'Val_loss', 'Actor_loss'):
+                    _watch[f"by_step/{short}"] = v.item() if torch.is_tensor(v) else v
+        if _watch:
+            _watch['steps'] = self.total_samples
+            wandb.log(_watch)
+            for k, v in _watch.items():
+                if k != 'steps':
+                    LOGGER.log_scalar(k, v, self.total_samples)
+
         self.cur_wandb_epoch += 1
 
     #### train state decoder
@@ -904,6 +922,25 @@ class DreamerLearner:
         else:
             adv = (lambda_returns - val).detach()
 
+        # Advantage statistics BEFORE advantage() rescales them to unit std. This is the
+        # number that says whether there is any signal at all: advantage() divides by
+        # A.std(), so a near-zero raw std is amplified into unit-scale *noise* and the
+        # normalised advantage looks healthy no matter how degenerate the raw one was.
+        # Split R and V so it is clear which side is flat.
+        _v_for_adv = val_unnormalized if self.use_valuenorm else val
+        log_metrics.update({
+            'Adv/raw_std':      adv.std(),
+            'Adv/raw_mean':     adv.mean(),
+            'Adv/raw_abs_max':  adv.abs().max(),
+            'Adv/return_std':   lambda_returns.std(),
+            'Adv/return_mean':  lambda_returns.mean(),
+            'Adv/value_std':    _v_for_adv.std(),
+            'Adv/value_mean':   _v_for_adv.mean(),
+            # if this ratio is << 1 the return carries no more information than the
+            # critic already has, i.e. the actor is being trained on the critic's noise
+            'Adv/raw_std_over_return_std': adv.std() / (lambda_returns.std() + 1e-8),
+        })
+
         # normalize adv
         adv = advantage(adv)
         adv = repeat(adv, 'b h d -> b h n d', n = self.config.NUM_AGENTS)
@@ -931,6 +968,10 @@ class DreamerLearner:
         log_metrics.update(tmp)
 
         self.cur_update += 1
+        # Accumulate over every minibatch of every PPO epoch. log_metrics.update() inside
+        # the loop only keeps the LAST minibatch, which is a single noisy sample -- that is
+        # exactly why Actor_loss looked like white noise around 0.
+        ppo_diag_acc = []
         for epoch in range(self.config.PPO_EPOCHS):
             inds = np.random.permutation(obs.shape[0])
 
@@ -943,11 +984,12 @@ class DreamerLearner:
                 idx = inds[i:i + step]
 
                 if not self.config.CONTINUOUS_ACTION:
-                    loss = actor_loss(obs[idx], act[idx], av_actions[idx] if av_actions is not None else None,
+                    loss, ppo_diag = actor_loss(obs[idx], act[idx], av_actions[idx] if av_actions is not None else None,
                                       logits_act[idx], adv[idx], self.actor, self.entropy, clip_param=self.config.clip_param)
                 else:
-                    loss = continuous_actor_loss(obs[idx], act[idx], None,
+                    loss, ppo_diag = continuous_actor_loss(obs[idx], act[idx], None,
                                                  logits_act[idx], adv[idx], self.actor, self.entropy, self.config.clip_param)
+                ppo_diag_acc.append(ppo_diag)
                 
                 actor_grad_norm = self.apply_optimizer(self.actor_optimizer, self.actor, loss, self.config.GRAD_CLIP_POLICY)
                 self.entropy *= self.config.ENTROPY_ANNEALING
@@ -992,6 +1034,16 @@ class DreamerLearner:
                 tmp = {'Agent/actor_grad_norm': actor_grad_norm.detach(), 'Agent/critic_grad_norm': critic_grad_norm.detach()}
                 log_metrics.update(tmp)
         
+        if ppo_diag_acc:
+            for k in ppo_diag_acc[0]:
+                vals = torch.stack([torch.as_tensor(d[k]).float() for d in ppo_diag_acc])
+                log_metrics[k] = vals.mean()
+            # KL of the LAST epoch alone: PPO_EPOCHS reuse the same batch, so the first
+            # epoch always has kl == 0 (rho == 1) and averaging hides whether the policy
+            # actually moved by the end of the update.
+            log_metrics['Policy/approx_kl_last'] = torch.as_tensor(
+                ppo_diag_acc[-1]['Policy/approx_kl']).float()
+
         # hard update critic
         if self.cur_update % self.config.TARGET_UPDATE == 0:
             self.old_critic = deepcopy(self.critic)

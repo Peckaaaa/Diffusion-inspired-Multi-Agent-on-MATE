@@ -40,7 +40,10 @@ class DreamerConfig(Config):
         self.ACTION_HIDDEN = 128 # 256
         self.REWARD_LAYERS = 2
         self.REWARD_HIDDEN = 256
-        self.GAMMA = 0.99  # discount factor
+        self.GAMMA = 0.95  # discount factor. NOT 0.99: with horizon=15 an effective
+                           # horizon of 1/(1-0.99)=100 steps means ~90% of the lambda-return's
+                           # variance comes from the bootstrap V(s_15) -- i.e. from the critic
+                           # itself -- instead of from reward the world model actually simulated.
         self.DISCOUNT = 0.99
         self.DISCOUNT_LAMBDA = 0.95  # lambda in dreamer v2
         self.IN_DIM = 30
