@@ -207,6 +207,7 @@ class DreamerLearner:
         self.cur_update = 1
         self.accum_samples = 0
         self.total_samples = 0
+        self.env_steps = 0
         self.init_optimizers()
         self.n_agents = 2
         Path(config.LOG_FOLDER).mkdir(parents=True, exist_ok=True)
@@ -272,7 +273,7 @@ class DreamerLearner:
                       'actor_optimizer', 'critic_optimizer')
     _RESUME_SCHEDS = ('denoiser_lr_sched', 'rew_end_model_lr_sched')
     _RESUME_SCALARS = ('train_count', 'step_count', 'cur_wandb_epoch', 'total_samples',
-                       'cur_update', 'accum_samples', 'n_agents', 'entropy')
+                       'cur_update', 'accum_samples', 'n_agents', 'entropy', 'env_steps')
 
     @staticmethod
     def _rms_to_dict(rms):
@@ -552,7 +553,12 @@ class DreamerLearner:
         )
         return normed_state
 
-    def step(self, rollout):
+    def step(self, rollout, env_steps=None):
+        # env_steps: bộ đếm của runner (cur_steps). Đây là trục quyền uy mà
+        # coverage_rate/eval_* dùng. total_samples là bộ đếm riêng của learner và đã
+        # trôi lệch khỏi cur_steps qua các lần resume, nên KHÔNG dùng nó làm trục log.
+        if env_steps is not None:
+            self.env_steps = env_steps
         if self.n_agents != rollout['action'].shape[-2]:
             self.n_agents = rollout['action'].shape[-2]
 
@@ -792,11 +798,11 @@ class DreamerLearner:
                         'Returns', 'Value', 'Val_loss', 'Actor_loss'):
                     _watch[f"by_step/{short}"] = v.item() if torch.is_tensor(v) else v
         if _watch:
-            _watch['steps'] = self.total_samples
+            _watch['steps'] = self.env_steps
             wandb.log(_watch)
             for k, v in _watch.items():
                 if k != 'steps':
-                    LOGGER.log_scalar(k, v, self.total_samples)
+                    LOGGER.log_scalar(k, v, self.env_steps)
 
         self.cur_wandb_epoch += 1
 

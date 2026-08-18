@@ -155,7 +155,7 @@ class DreamerRunner:
             LOGGER.log_scalar('metrics/returns', returns, cur_steps)
             LOGGER.log_scalar('metrics/epi_length', epi_length, cur_steps)
 
-            self.learner.step(rollout)
+            self.learner.step(rollout, env_steps=cur_steps)
 
             ## resume checkpoint: full state (model + optimizers + counters), overwritten in place so a
             ## Kaggle session that gets cut off mid-run always leaves one loadable, near-latest file behind.
