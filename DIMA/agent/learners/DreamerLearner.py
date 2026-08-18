@@ -314,9 +314,16 @@ class DreamerLearner:
             state['rng']['cuda'] = torch.cuda.get_rng_state_all()
         return state
 
-    def resume(self, load_path):
+    def resume(self, load_path, reset_critic=False):
         """Resume an interrupted run. Unlike load_pretrained(), does NOT set
-        self.evaluate / self.train_ac_only, so training continues normally."""
+        self.evaluate / self.train_ac_only, so training continues normally.
+
+        reset_critic: skip critic / critic_optimizer / value_normalizer and keep them
+        freshly initialised. Use this after changing GAMMA: the critic predicts
+        r/(1-gamma), so 0.99 -> 0.95 rescales its target ~5x and the stored weights are
+        calibrated to a value function that no longer exists. The world model
+        (state_decoder / denoiser / rew_end_model) is trained on supervised targets that
+        never involve gamma, so it stays valid and is worth keeping."""
         print(f"Resuming from {load_path}")
         # weights_only=False: format-1 checkpoints pickled a RunningMeanStd instance, which
         # torch>=2.6's safe unpickler rejects. Only ever point --resume_path at a checkpoint
@@ -325,9 +332,13 @@ class DreamerLearner:
         fmt = ckpt.get('format', 1)
         missing = []
 
+        skip = {'critic', 'old_critic', 'value_normalizer', 'critic_optimizer'} if reset_critic else set()
+        if reset_critic:
+            print("  --reset_critic: giu world model, khoi tao lai critic + value_normalizer")
+
         for name in self._RESUME_MODULES:
             mod = getattr(self, name, None)
-            if mod is None:
+            if mod is None or name in skip:
                 continue
             if name in ckpt:
                 mod.load_state_dict(ckpt[name])
@@ -335,7 +346,7 @@ class DreamerLearner:
                 missing.append(name)
         for name in self._RESUME_OPTIMS + self._RESUME_SCHEDS:
             obj = getattr(self, name, None)
-            if obj is None:
+            if obj is None or name in skip:
                 continue
             if name in ckpt:
                 obj.load_state_dict(ckpt[name])

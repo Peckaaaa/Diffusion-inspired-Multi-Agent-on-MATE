@@ -82,7 +82,8 @@ class DreamerServer:
 
 class DreamerRunner:
 
-    def __init__(self, env_config, learner_config, controller_config, n_workers, resume_path=None):
+    def __init__(self, env_config, learner_config, controller_config, n_workers, resume_path=None,
+                 reset_critic=False):
         self.n_workers = n_workers
         self.learner = learner_config.create_learner()
 
@@ -91,7 +92,7 @@ class DreamerRunner:
         if resume_path is not None:
             # Must resume BEFORE the DreamerServer/workers are created, otherwise the rollout
             # workers start from randomly-initialized params instead of the checkpointed ones.
-            self.resume_env_steps, self.resume_episode_count = self.learner.resume(resume_path)
+            self.resume_env_steps, self.resume_episode_count = self.learner.resume(resume_path, reset_critic=reset_critic)
 
         self.server = DreamerServer(n_workers, env_config, controller_config, self.learner.params())
 

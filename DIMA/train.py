@@ -73,6 +73,9 @@ def parse_args():
     # crash/interrupt resume: full model + optimizer + counters (unlike --load_path, which is eval-only)
     parser.add_argument('--resume_path', type=str, default=None,
                          help='Path to a latest_resume.pth checkpoint to continue an interrupted run from.')
+    parser.add_argument('--reset_critic', action='store_true',
+                         help='Resume the world model but re-initialise critic/value_normalizer. '
+                              'Required after changing GAMMA, which rescales the critic target.')
     parser.add_argument('--save_interval', type=int, default=5000,
                          help='Env steps between lightweight eval-snapshot checkpoints.')
     parser.add_argument('--save_resume_every_episodes', type=int, default=1,
@@ -89,8 +92,9 @@ def parse_args():
 
 
 def train_dreamer(exp, n_workers, resume_path=None, save_interval=5000, save_resume_every_episodes=1,
-                  max_hours=None):
-    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers, resume_path=resume_path)
+                  max_hours=None, reset_critic=False):
+    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers, resume_path=resume_path,
+                           reset_critic=reset_critic)
     runner.run(exp.steps, exp.episodes, save_interval=save_interval, save_mode='interval',
                resume_env_steps=runner.resume_env_steps,
                resume_episode_count=runner.resume_episode_count,
@@ -375,4 +379,5 @@ if __name__ == "__main__":
 
     train_dreamer(exp, n_workers=args.n_workers, resume_path=args.resume_path,
                   save_interval=args.save_interval, save_resume_every_episodes=args.save_resume_every_episodes,
+                  reset_critic=args.reset_critic,
                   max_hours=args.max_hours)
