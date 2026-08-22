@@ -25,15 +25,16 @@ class ValueNorm(nn.Module):
         self.per_element_update = per_element_update
         self.tpdv = dict(dtype=torch.float32, device=device)
 
-        self.running_mean = nn.Parameter(
-            torch.zeros(input_shape), requires_grad=False
-        ).to(**self.tpdv)
-        self.running_mean_sq = nn.Parameter(
-            torch.zeros(input_shape), requires_grad=False
-        ).to(**self.tpdv)
-        self.debiasing_term = nn.Parameter(torch.tensor(0.0), requires_grad=False).to(
-            **self.tpdv
-        )
+        # register_buffer, KHONG phai `nn.Parameter(...).to(device)`. Calling .to() on a
+        # Parameter with a *different* device returns a plain Tensor, so the old code only
+        # registered these on CPU: on GPU they became untracked attributes and state_dict()
+        # came back empty. That is why GPU-trained checkpoints carry `value_normalizer: {}`
+        # and why the value scale reset at every session boundary. Buffers are always
+        # registered, always in state_dict(), and still work with the in-place mul_/add_
+        # updates below (requires_grad=False is implicit for buffers).
+        self.register_buffer("running_mean", torch.zeros(input_shape, **self.tpdv))
+        self.register_buffer("running_mean_sq", torch.zeros(input_shape, **self.tpdv))
+        self.register_buffer("debiasing_term", torch.tensor(0.0, **self.tpdv))
 
     def running_mean_var(self):
         """Get running mean and variance."""
