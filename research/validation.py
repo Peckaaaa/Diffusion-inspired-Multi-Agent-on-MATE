@@ -90,6 +90,24 @@ class ValidationEpisode:
         return cls(transitions=steps)
 
 
+def _history_at(episode: ValidationEpisode, t: int, conditioning: int) -> History:
+    """Conditioning window ending at ``t``, following ``History``'s alignment.
+
+    ``actions[i]`` is the action that produced ``states[i]``, so the action stored
+    alongside step ``k`` is ``transitions[k-1].action`` -- see
+    ``research/world_model.py:History``.
+    """
+
+    history = History(length=conditioning)
+    for k in range(t - conditioning + 1, t + 1):
+        history.states.append(episode.transitions[k].state)
+        history.observations.append(episode.transitions[k].obs)
+        history.actions.append(
+            episode.transitions[k - 1].action if k > 0 else episode.transitions[k].action
+        )
+    return history
+
+
 def validate(
     world_model,
     episodes: Sequence[ValidationEpisode],
@@ -101,19 +119,26 @@ def validate(
     states_per_episode: int = 4,
     sensitivity_samples: int = 4,
     sensitivity_actions: int = 9,
+    sensitivity_states: int = 3,
     seed: int = 0,
 ) -> Dict[str, Any]:
     """Prediction error and action sensitivity on held-out data.
 
-    ``sensitivity_actions`` sub-samples the action set (evenly spaced) because
-    the full sweep costs ``num_cameras * num_actions * sensitivity_samples``
-    diffusion samples; the ratio is stable under sub-sampling, and this runs
-    inside the training loop.
+    Reproducibility is the whole point here. ``seed`` is deliberately *not* varied
+    per call: every validation must score the **same** held-out states, or
+    pass-to-pass differences measure which states got sampled rather than whether
+    the model improved. Measured on a short CPU run, resampling the states made
+    ADE wander by ±50 while the model barely moved.
+
+    ``sensitivity_actions`` sub-samples the action set (evenly spaced) because the
+    full sweep costs ``num_cameras * num_actions * sensitivity_samples`` diffusion
+    samples; the ratio is stable under sub-sampling. ``sensitivity_states``
+    averages the ratio over several states, since a single state is a noisy
+    estimate of it.
     """
 
     from research.diagnostics import horizon_error_report
 
-    rng = np.random.default_rng(seed)
     if hasattr(world_model, 'eval_mode'):
         world_model.eval_mode()
 
@@ -123,33 +148,34 @@ def validate(
         layout,
         horizons=horizons,
         max_states_per_episode=states_per_episode,
-        rng=rng,
+        rng=np.random.default_rng(seed),
     )
 
     conditioning = max(1, world_model.conditioning_steps)
-    sensitivity = None
     usable = [ep for ep in episodes if len(ep.transitions) > conditioning + 2]
-    if usable:
+    subset = np.unique(
+        np.linspace(0, num_actions - 1, min(sensitivity_actions, num_actions)).astype(int)
+    )
+
+    # A fresh generator, seeded identically on every call, so the sensitivity
+    # states are also fixed across passes.
+    rng = np.random.default_rng(seed + 1)
+    measured: List[Any] = []
+    for _ in range(max(1, sensitivity_states)):
+        if not usable:
+            break
         episode = usable[int(rng.integers(len(usable)))]
         t = int(rng.integers(conditioning - 1, len(episode.transitions) - 1))
-        history = History(length=conditioning)
-        for k in range(t - conditioning + 1, t + 1):
-            history.states.append(episode.transitions[k].state)
-            history.observations.append(episode.transitions[k].obs)
-            history.actions.append(
-                episode.transitions[k - 1].action if k > 0 else episode.transitions[k].action
+        measured.append(
+            compute_action_sensitivity(
+                world_model,
+                _history_at(episode, t, conditioning),
+                episode.transitions[t].action,
+                num_cameras=num_agents,
+                num_actions=num_actions,
+                num_samples=sensitivity_samples,
+                action_subset=subset,
             )
-        subset = np.unique(
-            np.linspace(0, num_actions - 1, min(sensitivity_actions, num_actions)).astype(int)
-        )
-        sensitivity = compute_action_sensitivity(
-            world_model,
-            history,
-            episode.transitions[t].action,
-            num_cameras=num_agents,
-            num_actions=num_actions,
-            num_samples=sensitivity_samples,
-            action_subset=subset,
         )
 
     row: Dict[str, Any] = {}
@@ -158,11 +184,21 @@ def validate(
         row[f'rmse_h{horizon}'] = stat.rmse
         row[f'ade_h{horizon}'] = stat.ade
         row[f'coverage_mae_h{horizon}'] = stat.coverage_mae
-    if sensitivity is not None:
-        row['sensitivity_between'] = sensitivity.between
-        row['sensitivity_within'] = sensitivity.within
-        row['sensitivity_ratio'] = sensitivity.ratio
-        row['sensitivity_asymmetry'] = sensitivity.asymmetry
+
+    if measured:
+        row['sensitivity_states'] = len(measured)
+        for field_name in ('between', 'within', 'ratio', 'asymmetry'):
+            values = [
+                getattr(s, field_name)
+                for s in measured
+                if getattr(s, field_name) is not None and np.isfinite(getattr(s, field_name))
+            ]
+            row[f'sensitivity_{field_name}'] = float(np.mean(values)) if values else None
+        if row['sensitivity_ratio'] is None and any(
+            s.ratio == float('inf') for s in measured
+        ):
+            # Every state was deterministic -- see diagnostics._sensitivity_ratio.
+            row['sensitivity_ratio'] = float('inf')
     return row
 
 

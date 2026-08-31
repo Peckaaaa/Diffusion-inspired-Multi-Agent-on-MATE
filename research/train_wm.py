@@ -288,7 +288,10 @@ def train(
                 num_agents=env.n_agents,
                 num_actions=env.n_actions,
                 sensitivity_samples=sensitivity_samples,
-                seed=seed + tag,
+                # Deliberately NOT varied per pass: the same held-out states must
+                # be scored every time, or the trend measures sampling, not the
+                # model.  See research/validation.py.
+                seed=seed,
             )
             row['pass'] = tag
             row['train_count'] = learner.train_count

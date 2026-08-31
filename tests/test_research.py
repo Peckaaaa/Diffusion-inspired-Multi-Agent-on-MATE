@@ -486,6 +486,41 @@ class TestValidation(unittest.TestCase):
         finally:
             env.close()
 
+    def test_validation_scores_the_same_states_every_call(self):
+        """The trend must reflect the model, not which states got sampled."""
+
+        from research.validation import ValidationEpisode, validate
+
+        env = make_env(max_episode_steps=40)
+        try:
+            episodes = [
+                ValidationEpisode.from_rollout(self._rollout(env, 40)[0], env) for _ in range(2)
+            ]
+            layout = ObservationLayout.from_env_metadata(env.metadata())
+            kwargs = dict(
+                num_agents=env.n_agents,
+                num_actions=env.n_actions,
+                states_per_episode=3,
+                sensitivity_samples=2,
+                sensitivity_actions=3,
+                sensitivity_states=2,
+            )
+            model = OracleWorldModel(env)
+
+            first = validate(model, episodes, layout, seed=0, **kwargs)
+            # Disturb the global RNG: a correct implementation is unaffected.
+            np.random.default_rng(123).random(50)
+            second = validate(model, episodes, layout, seed=0, **kwargs)
+            self.assertEqual(first, second)
+
+            # ...and the seed is genuinely what selects the states. `mae_h1` is
+            # always defined; `ade_h1` is None when no target was sighted in the
+            # sampled ground-truth states, which is common in short random rollouts.
+            other = validate(model, episodes, layout, seed=99, **kwargs)
+            self.assertNotEqual(first['mae_h1'], other['mae_h1'])
+        finally:
+            env.close()
+
     def test_trend_arrows_follow_the_direction_of_change(self):
         from research.validation import format_trend
 
