@@ -32,6 +32,7 @@ from research.diagnostics import (
     horizon_error_report,
     prediction_validity,
 )
+from research.config import configure_torch, default_device
 from research.env_adapter import DEFAULT_SCENARIO, MATEEnv
 from research.logging_utils import RunLogger, log
 from research.planners import build_planner
@@ -353,6 +354,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--discrete-levels', type=int, default=5)
     parser.add_argument('--checkpoint', default=None)
     parser.add_argument('--device', default=None)
+    parser.add_argument('--threads', type=int, default=None, help='torch CPU thread count')
     parser.add_argument('--horizon', type=int, default=1, help='planning horizon')
     parser.add_argument('--num-samples', type=int, default=1, help='diffusion samples per query')
     parser.add_argument('--diagnostics', action='store_true')
@@ -374,6 +376,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else [(args.planner, args.world_model)]
     )
 
+    device = args.device or default_device()
+    torch_setup = configure_torch(device, detect_anomaly=False, threads=args.threads, seed=args.seed)
+
     with RunLogger(
         run_dir,
         name=f'eval-{args.scenario}-s{args.seed}',
@@ -382,7 +387,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tensorboard=args.tensorboard,
         group=f'eval-{args.scenario}',
     ) as logger:
-        logger.update_manifest(phase='evaluation', rows=[list(row) for row in rows])
+        logger.update_manifest(
+            phase='evaluation', rows=[list(row) for row in rows], torch_setup=torch_setup
+        )
 
         summaries: List[Dict[str, Any]] = []
         for planner_spec, world_model_spec in rows:
@@ -400,7 +407,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_episode_steps=args.max_episode_steps,
                 discrete_levels=args.discrete_levels,
                 checkpoint=args.checkpoint,
-                device=args.device,
+                device=device,
                 horizon=args.horizon,
                 num_samples=args.num_samples,
                 logger=logger,

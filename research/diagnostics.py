@@ -336,21 +336,36 @@ def compute_action_sensitivity(
 
     stats.per_camera = {c: v for c, v in per_camera_between.items()}
     stats.per_camera_ratio = {
-        c: (per_camera_between[c] / per_camera_within[c])
-        if np.isfinite(per_camera_within[c]) and per_camera_within[c] > 0
-        else float('nan')
+        c: (
+            _sensitivity_ratio(per_camera_between[c], per_camera_within[c])
+            if np.isfinite(per_camera_within[c])
+            else None
+        )
         for c in per_camera_between
     }
     finite_between = [v for v in per_camera_between.values() if np.isfinite(v)]
     finite_within = [v for v in per_camera_within.values() if np.isfinite(v)]
     stats.between = float(np.mean(finite_between)) if finite_between else None
     stats.within = float(np.mean(finite_within)) if finite_within else None
-    stats.ratio = (
-        stats.between / stats.within
-        if stats.between is not None and stats.within not in (None, 0.0)
-        else None
-    )
+    stats.ratio = _sensitivity_ratio(stats.between, stats.within)
     return stats
+
+
+def _sensitivity_ratio(between: Optional[float], within: Optional[float]) -> Optional[float]:
+    """between / within, with the deterministic case handled explicitly.
+
+    A deterministic world model -- the oracle, which forks an environment whose
+    RNG state is copied with it -- has a sampling noise floor of exactly zero.
+    The ratio is then infinite, and that is the correct reading: *all* of the
+    variation between actions is action effect. Returning ``None`` there would
+    make a perfect model indistinguishable from an unmeasurable one.
+    """
+
+    if between is None or within is None:
+        return None
+    if within > 0.0:
+        return between / within
+    return float('inf') if between > 0.0 else None
 
 
 # --------------------------------------------------------------------------- #

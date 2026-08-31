@@ -26,6 +26,7 @@ import numpy as np
 
 import research  # noqa: F401 - installs sys.path + compat shims
 
+from research.config import configure_torch, default_device
 from research.env_adapter import MATEEnv
 from research.logging_utils import log
 from research.views import ObservationLayout, SceneView
@@ -402,6 +403,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    setup = configure_torch(args.device or default_device(), detect_anomaly=False, seed=args.seed)
+    log('RUN', f'torch: {setup}')
     test = SmokeTest(
         scenario=args.scenario,
         seed=args.seed,

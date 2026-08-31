@@ -310,6 +310,28 @@ class DIMAWorldModel(WorldModel):
 
     uses_privileged_state = True
 
+    @classmethod
+    def from_learner(
+        cls,
+        learner,
+        env: MATEEnv,
+        config,
+        *,
+        name: str = 'dima',
+        num_samples: int = 1,
+    ) -> 'DIMAWorldModel':
+        """Wrap a *live* ``DreamerLearner`` instead of loading a checkpoint.
+
+        Used for mid-training validation: the point of that measurement is the
+        model as it stands right now, so it must read the learner's current
+        modules and its current ``state_rms``, not a snapshot on disk.
+        """
+
+        model = cls.__new__(cls)
+        WorldModel.__init__(model, name)
+        model._attach(learner, env, config, num_samples=num_samples, checkpoint_path=None)
+        return model
+
     def __init__(
         self,
         env: MATEEnv,
@@ -372,6 +394,14 @@ class DIMAWorldModel(WorldModel):
         # this object only ever runs forward passes.
         torch.autograd.set_detect_anomaly(False)
 
+        self._attach(
+            self._learner, env, config, num_samples=num_samples, checkpoint_path=checkpoint_path
+        )
+
+    def _attach(self, learner, env: MATEEnv, config, *, num_samples: int, checkpoint_path) -> None:
+        """Bind to a learner's modules. Shared by the load path and :meth:`from_learner`."""
+
+        self._learner = learner
         self.config = config
         self.env_metadata = env.metadata()
         self.device = torch.device(config.DEVICE)
@@ -381,6 +411,8 @@ class DIMAWorldModel(WorldModel):
         self.obs_dim = int(config.IN_DIM)
         self.conditioning_steps = int(config.denoiser_cfg.inner_model.num_steps_conditioning)
         self.checkpoint_path = checkpoint_path
+        if not hasattr(self, 'checkpoint_config'):
+            self.checkpoint_config = None
         #: >1 draws several diffusion samples per query and reports their spread
         #: as ``Prediction.uncertainty``.  The denoiser is stochastic, so this is
         #: sampling spread, not a calibrated uncertainty.
@@ -388,10 +420,10 @@ class DIMAWorldModel(WorldModel):
 
         from agent.world_models.diffusion import DiffusionSampler
 
-        self.sampler = DiffusionSampler(self._learner.denoiser, config.diffusion_sampler_cfg)
-        self.state_decoder = self._learner.state_decoder
-        self.rew_end_model = self._learner.rew_end_model
-        self.state_rms = self._learner.state_rms
+        self.sampler = DiffusionSampler(learner.denoiser, config.diffusion_sampler_cfg)
+        self.state_decoder = learner.state_decoder
+        self.rew_end_model = learner.rew_end_model
+        self.state_rms = learner.state_rms
 
         self._camera_observation_space = env.camera_observation_space
         self._unrescale_obs = env.unrescale_obs
@@ -401,12 +433,12 @@ class DIMAWorldModel(WorldModel):
         # odd number of levels, which DiscreteCamera already enforces.
         self._noop_action = (env.discrete_levels**2) // 2
 
-        self._rms_mean = torch.as_tensor(
-            self.state_rms.mean, dtype=torch.float32, device=self.device
-        )
-        self._rms_std = torch.sqrt(
-            torch.as_tensor(self.state_rms.var + 1e-8, dtype=torch.float32, device=self.device)
-        )
+    def eval_mode(self) -> None:
+        """Put every module in eval mode -- required when validating mid-training."""
+
+        self._learner.denoiser.eval()
+        self._learner.state_decoder.eval()
+        self._learner.rew_end_model.eval()
 
     # -- properties -------------------------------------------------------- #
 
@@ -430,13 +462,31 @@ class DIMAWorldModel(WorldModel):
 
     # -- normalisation ------------------------------------------------------ #
 
+    def _rms(self):
+        """Current state normaliser as tensors.
+
+        Read from ``self.state_rms`` on every call rather than cached at
+        construction: ``DreamerLearner.step`` keeps updating ``state_rms`` as data
+        arrives, so a cached copy silently goes stale during mid-training
+        validation and every prediction comes out shifted. 124 floats per call is
+        nothing next to a diffusion sample.
+        """
+
+        mean = torch.as_tensor(self.state_rms.mean, dtype=torch.float32, device=self.device)
+        std = torch.sqrt(
+            torch.as_tensor(self.state_rms.var + 1e-8, dtype=torch.float32, device=self.device)
+        )
+        return mean, std
+
     def _normalize_state(self, states: torch.Tensor) -> torch.Tensor:
         """``DreamerLearner.normalize_state`` (line 266) on a ``(B, T, D)`` tensor."""
 
-        return (states - self._rms_mean) / self._rms_std
+        mean, std = self._rms()
+        return (states - mean) / std
 
     def _denormalize_state(self, states: torch.Tensor) -> torch.Tensor:
-        return states * self._rms_std + self._rms_mean
+        mean, std = self._rms()
+        return states * std + mean
 
     # -- prediction --------------------------------------------------------- #
 

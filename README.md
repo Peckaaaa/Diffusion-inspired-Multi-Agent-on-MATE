@@ -94,6 +94,85 @@ RESEARCH_SLOW_TESTS=1 python -m unittest tests.test_research   # + the full pipe
 
 ---
 
+## Running on a GPU server
+
+The laptop path above exists to prove the pipeline; real training belongs on a
+GPU. Three things are set up for that, and one of them matters a lot.
+
+### `configure_torch` runs before any DIMA module is built
+
+`train_wm.py`, `evaluate.py` and `smoke_test.py` all call
+`research.config.configure_torch(device, ...)`, which:
+
+* **turns autograd anomaly detection off.** DIMA enables
+  `torch.autograd.set_detect_anomaly(True)` globally — in `train.py` *and* in
+  `DreamerLearner.__init__:83`. It records a traceback for every op in the graph
+  and re-runs the backward pass hunting NaNs, which costs a large multiple of
+  normal training time and holds extra memory. It is re-applied *after* the
+  learner is constructed, because the constructor turns it back on. Restore it
+  with `--detect-anomaly` only to chase an actual NaN.
+* **enables TF32** (`matmul.allow_tf32`, `cudnn.allow_tf32`,
+  `set_float32_matmul_precision('high')`) and **`cudnn.benchmark`**. The denoiser
+  is matmul-bound and shapes are fixed after the first batch, so this is the
+  largest free speedup available.
+* **seeds** torch / numpy / random / CUDA together and records what it applied in
+  the run manifest.
+
+The GPU name, compute capability, memory and the flags actually applied are
+printed as an `[WM]` line and stored in `manifest.json`. On CPU it prints a
+`[WARN]` saying the path is for testing, not for training.
+
+### Watch the metrics that matter, not the loss
+
+Falling denoising loss does not mean the model is learning anything a planner can
+use — it can fall while the model settles into an action-*independent* prior,
+which is exactly what happened in the CPU run below. `train_wm.py` therefore
+holds out episodes and validates on them:
+
+```bash
+python -m research.train_wm --dataset datasets/mate4v2-mixed --run-dir runs/wm-gpu \
+    --passes 20 --horizon 5 \
+    --val-episodes 20 --eval-every 1 --sensitivity-samples 8
+```
+
+```
+[WM-DIAG] ade_h1=610.2413  mae_h1=137.3911  sensitivity_ratio=0.9971
+[WARN] action sensitivity ratio 0.997 < 1.0 -- changing the action still moves the
+       prediction less than re-sampling it does, so no planner can use this model yet.
+[WM-DIAG] ade_h1=484.7062↓  mae_h1=136.0159↓  sensitivity_ratio=1.0273↑
+```
+
+Arrows show the direction of the last step, so a stalled or oscillating run is
+visible in the console. The two numbers to watch:
+
+| metric | wanted | meaning |
+|---|---|---|
+| `ade_h1` | ↓ | average displacement error of predicted target positions, MATE units |
+| `sensitivity_ratio` | ↑, and **above 1.0** | action effect vs. diffusion sampling noise; below 1.0 no planner can use the model |
+
+A `[WARN]` fires on every validation where the ratio is still below 1.0.
+
+### Everything is recorded, in three places
+
+* `<run>/wm_validation.jsonl` — the held-out metrics above, per pass.
+* `<run>/dima_scalars.jsonl` — **every scalar DIMA itself logs**, teed from
+  `tb_logger.LOGGER` without touching DIMA: `denoiser/train/loss_denoising`,
+  `state_decoder/train/vq/rec_loss`, `rew_end_model/train/loss_total`, and 26
+  more. Both files are strict JSON (NaN and Inf are written as `null`).
+* wandb and TensorBoard, via DIMA's own loggers — `--wandb-mode online`,
+  `--tensorboard`.
+
+### Checkpoints are self-describing
+
+`ckpt/config.json` is written next to every checkpoint, before the first save, so
+a run that dies mid-way still leaves loadable checkpoints. `DIMAWorldModel` reads
+it automatically. This matters because `horizon` sizes `TransRewEndModel`'s
+positional embedding, masks and head slicers: a model trained at `--horizon 5`
+cannot be loaded at the default 15, and without the sidecar the failure is a wall
+of `size mismatch` lines that never mentions horizons.
+
+---
+
 ## What lives where
 
 | Path | Role |

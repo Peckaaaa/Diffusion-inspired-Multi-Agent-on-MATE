@@ -402,6 +402,101 @@ class TestHistoryAlignment(unittest.TestCase):
             env.close()
 
 
+class TestTorchSetup(unittest.TestCase):
+    """The GPU/stability settings applied before any DIMA module is built."""
+
+    def test_anomaly_detection_is_off_by_default(self):
+        import torch
+
+        from research.config import configure_torch
+
+        torch.autograd.set_detect_anomaly(True)
+        applied = configure_torch('cpu')
+        self.assertFalse(applied['detect_anomaly'])
+        # A grad-requiring op is the only way to observe the global flag.
+        x = torch.zeros(1, requires_grad=True)
+        (x * 2).sum().backward()
+        self.assertIn('torch_threads', applied)
+
+    def test_seeding_is_recorded_and_deterministic(self):
+        import torch
+
+        from research.config import configure_torch
+
+        applied = configure_torch('cpu', seed=7)
+        self.assertEqual(applied['seed'], 7)
+        first = torch.randn(4)
+        configure_torch('cpu', seed=7)
+        np.testing.assert_allclose(first.numpy(), torch.randn(4).numpy())
+
+
+class TestValidation(unittest.TestCase):
+    """Held-out validation, the signal the server run is watched with."""
+
+    def _rollout(self, env, steps=30):
+        planner = build_planner('random', env, seed=0)
+        result = run_episode(env, planner, seed=0, max_steps=steps)
+        return to_dima_rollout(result, env.n_actions), result
+
+    def test_validation_episode_reconstructs_the_successor_observation(self):
+        from research.validation import ValidationEpisode
+
+        env = make_env(max_episode_steps=30)
+        try:
+            rollout, result = self._rollout(env, 30)
+            episode = ValidationEpisode.from_rollout(rollout, env)
+
+            # One shorter: the last step has no stored successor.
+            self.assertEqual(len(episode.transitions), len(result.transitions) - 1)
+            for t, step in enumerate(episode.transitions):
+                # The dataset stores float32, so a coordinate of ~1000 round-trips
+                # to about 1e-5; compare at float32 precision, not float64.
+                np.testing.assert_allclose(
+                    step.next_obs_raw, result.transitions[t].next_obs_raw, rtol=1e-5, atol=1e-3
+                )
+                np.testing.assert_array_equal(step.action, result.transitions[t].action)
+        finally:
+            env.close()
+
+    def test_validate_reports_the_metrics_training_is_watched_on(self):
+        from research.validation import ValidationEpisode, format_trend, validate
+
+        env = make_env(max_episode_steps=30)
+        try:
+            episodes = [ValidationEpisode.from_rollout(self._rollout(env, 30)[0], env)]
+            layout = ObservationLayout.from_env_metadata(env.metadata())
+            row = validate(
+                OracleWorldModel(env),
+                episodes,
+                layout,
+                num_agents=env.n_agents,
+                num_actions=env.n_actions,
+                states_per_episode=2,
+                sensitivity_samples=2,
+                sensitivity_actions=3,
+            )
+            for key in ('mae_h1', 'rmse_h1', 'ade_h1', 'sensitivity_ratio'):
+                self.assertIn(key, row)
+            # The oracle is the real environment, so it must be far from action-blind.
+            self.assertGreater(row['sensitivity_ratio'], 1.0)
+
+            line = format_trend([row], ('ade_h1', 'sensitivity_ratio'))
+            self.assertIn('sensitivity_ratio=', line)
+            self.assertIn('N/A', format_trend([{'ade_h1': None}], ('ade_h1',)))
+        finally:
+            env.close()
+
+    def test_trend_arrows_follow_the_direction_of_change(self):
+        from research.validation import format_trend
+
+        rising = format_trend([{'x': 1.0}, {'x': 2.0}], ('x',))
+        falling = format_trend([{'x': 2.0}, {'x': 1.0}], ('x',))
+        flat = format_trend([{'x': 1.0}, {'x': 1.0}], ('x',))
+        self.assertIn('↑', rising)
+        self.assertIn('↓', falling)
+        self.assertIn('→', flat)
+
+
 class TestOraclePlannerBeatsRandom(unittest.TestCase):
     """The planner interface works if a perfect model makes it act better."""
 

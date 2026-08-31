@@ -247,6 +247,42 @@ class RunLogger:
             except (TypeError, ValueError):
                 pass
 
+    def tee_dima_scalars(self, stream: str = 'dima_scalars') -> None:
+        """Also capture every scalar DIMA logs, without touching DIMA.
+
+        ``DreamerLearner.step`` reports its losses through ``tb_logger.LOGGER``
+        (and wandb), and those are the curves that say whether training is going
+        anywhere: ``denoiser/train/loss_denoising``,
+        ``state_decoder/train/vq/rec_loss``, ``rew_end_model/train/loss_total``
+        and friends. ``LOGGER`` is a module-level singleton, so wrapping its
+        ``log_scalar`` here tees the whole stream into ``<run_dir>/<stream>.jsonl``
+        while leaving TensorBoard behaviour unchanged. Nothing inside DIMA is
+        modified or monkey-patched -- the wrapper lives on the object this
+        process happens to hold.
+        """
+
+        if getattr(self._tb, '_research_tee', None) is not None:
+            return
+
+        original = self._tb.log_scalar
+        logger = self
+
+        def log_scalar(tag, value, step):
+            try:
+                logger.records(stream, [{'tag': tag, 'value': float(value), 'step': int(step)}])
+            except (TypeError, ValueError):
+                pass
+            return original(tag, value, step)
+
+        self._tb.log_scalar = log_scalar
+        self._tb._research_tee = original
+
+    def stop_tee_dima_scalars(self) -> None:
+        original = getattr(self._tb, '_research_tee', None)
+        if original is not None:
+            self._tb.log_scalar = original
+            self._tb._research_tee = None
+
     def records(self, stream: str, rows: Iterable[Mapping[str, Any]]) -> None:
         """Append structured rows to ``<run_dir>/<stream>.jsonl``.
 
@@ -258,10 +294,11 @@ class RunLogger:
             handle = (self.run_dir / f'{stream}.jsonl').open('a', encoding='utf-8')
             self._files[stream] = handle
         for row in rows:
-            handle.write(json.dumps(row, default=_jsonable) + '\n')
+            handle.write(json.dumps(_finite(row), default=_jsonable) + '\n')
         handle.flush()
 
     def close(self) -> None:
+        self.stop_tee_dima_scalars()
         for handle in self._files.values():
             handle.close()
         self._files.clear()
@@ -276,11 +313,37 @@ class RunLogger:
         self.close()
 
 
+def _finite(value: Any) -> Any:
+    """Replace NaN / +-Inf with ``null`` so the JSONL stays valid JSON.
+
+    ``json.dumps`` happily writes bare ``NaN`` and ``Infinity``, which Python can
+    read back but strict parsers -- pandas, jq, most JS -- cannot. These values
+    are meaningful here (``NaN`` = not applicable this step, ``Inf`` = a
+    deterministic model's sensitivity ratio), so they are recorded as ``null``
+    rather than dropped; the console rendering keeps them as ``N/A``.
+    """
+
+    import math
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
 def _jsonable(value: Any) -> Any:
+    import math
+
     import numpy as np
 
     if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.floating, np.integer, np.bool_)):
+        return _finite(value.tolist())
+    if isinstance(value, np.floating):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, (np.integer, np.bool_)):
         return value.item()
     return str(value)

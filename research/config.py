@@ -38,6 +38,7 @@ __all__ = [
     'apply_env_info',
     'build_learner_config',
     'default_device',
+    'configure_torch',
     'allow_dima_checkpoint_globals',
     'export_checkpoint_config',
     'apply_checkpoint_config',
@@ -102,6 +103,81 @@ def default_device() -> str:
         # MPS lacks kernels DIMA's diffusion path uses; CPU is the safe fallback.
         return 'cpu'
     return 'cpu'
+
+
+def configure_torch(
+    device: str,
+    *,
+    detect_anomaly: bool = False,
+    tf32: bool = True,
+    matmul_precision: str = 'high',
+    threads: Optional[int] = None,
+    cudnn_benchmark: bool = True,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Put PyTorch in the right mode before any DIMA module is built.
+
+    Call this *before* constructing ``DreamerLearner``, and once more after (it is
+    idempotent) because ``DreamerLearner.__init__`` re-enables anomaly detection.
+
+    ``detect_anomaly`` is the one that matters most on a GPU. DIMA turns
+    ``torch.autograd.set_detect_anomaly(True)`` on globally, in
+    ``train.py`` *and* in ``DreamerLearner.__init__`` (line 83). It is a debugging
+    aid: it records a traceback for every op in the graph and re-runs the backward
+    pass to find NaNs, which costs a large multiple of normal training time and
+    holds extra memory. Leaving it on for a real training run is a mistake, so it
+    is off here by default and restored only with ``--detect-anomaly``.
+
+    ``tf32`` and ``matmul_precision`` let Ampere-and-later cards use TensorFloat-32
+    for matmuls and convolutions. The denoiser is matmul-bound, so this is the
+    single biggest free speedup; it costs a little mantissa precision, which
+    diffusion training tolerates. ``cudnn_benchmark`` lets cuDNN pick algorithms
+    per shape -- worth it because shapes here are fixed after the first batch.
+
+    Returns what was actually applied, so the run manifest records it.
+    """
+
+    applied: Dict[str, Any] = {'device': device, 'detect_anomaly': bool(detect_anomaly)}
+
+    torch.autograd.set_detect_anomaly(bool(detect_anomaly))
+
+    if threads:
+        torch.set_num_threads(int(threads))
+    applied['torch_threads'] = torch.get_num_threads()
+
+    if device.startswith('cuda') and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
+        torch.backends.cudnn.allow_tf32 = bool(tf32)
+        torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision(matmul_precision)
+        applied.update(
+            tf32=bool(tf32),
+            cudnn_benchmark=bool(cudnn_benchmark),
+            matmul_precision=matmul_precision,
+            gpu_name=torch.cuda.get_device_name(0),
+            gpu_count=torch.cuda.device_count(),
+            gpu_capability='.'.join(str(x) for x in torch.cuda.get_device_capability(0)),
+            gpu_total_memory_gb=round(
+                torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+            ),
+        )
+    else:
+        applied['cuda_available'] = torch.cuda.is_available()
+
+    if seed is not None:
+        import random as _random
+
+        import numpy as _np
+
+        torch.manual_seed(seed)
+        _np.random.seed(seed)
+        _random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        applied['seed'] = int(seed)
+
+    return applied
 
 
 class _MATEConfigMixin:

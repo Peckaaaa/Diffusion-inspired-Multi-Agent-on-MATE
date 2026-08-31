@@ -32,7 +32,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -43,10 +43,13 @@ from research.config import (
     CHECKPOINT_CONFIG_FILENAME,
     allow_dima_checkpoint_globals,
     build_learner_config,
+    configure_torch,
     export_checkpoint_config,
 )
 from research.env_adapter import MATEEnv
 from research.logging_utils import RunLogger, log
+from research.validation import ValidationEpisode, format_trend, validate
+from research.views import ObservationLayout
 
 
 def build_env_from_manifest(manifest: Dict, *, seed: int = 0) -> MATEEnv:
@@ -123,12 +126,23 @@ def train(
     remodel_steps: Optional[int] = None,
     train_actor_critic: bool = False,
     save_every: int = 1,
+    val_episodes: int = 20,
+    eval_every: int = 1,
+    sensitivity_samples: int = 4,
+    detect_anomaly: bool = False,
+    threads: Optional[int] = None,
     wandb_mode: str = 'disabled',
     tensorboard: bool = False,
 ) -> Path:
     manifest, rollouts = load_dataset(dataset_dir)
     env = build_env_from_manifest(manifest, seed=seed)
     check_dataset(manifest, rollouts, env)
+
+    # Held-out split, taken deterministically from the tail so that re-running
+    # with the same dataset validates on the same episodes.
+    val_episodes = max(0, min(int(val_episodes), max(0, len(rollouts) - 1)))
+    validation_rollouts = rollouts[len(rollouts) - val_episodes :] if val_episodes else []
+    rollouts = rollouts[: len(rollouts) - val_episodes] if val_episodes else rollouts
 
     overrides: Dict[str, object] = {}
     if min_buffer_size is not None:
@@ -153,6 +167,9 @@ def train(
         overrides=overrides,
     )
     allow_dima_checkpoint_globals()
+    torch_setup = configure_torch(
+        config.DEVICE, detect_anomaly=detect_anomaly, threads=threads, seed=seed
+    )
 
     required = minimum_buffer_steps(config)
     if config.MIN_BUFFER_SIZE < required:
@@ -174,9 +191,25 @@ def train(
     log('ENV', env.describe())
     log(
         'DATA',
-        f'{len(rollouts)} episodes / {total_steps} steps from {dataset_dir} '
+        f'{len(rollouts)} train episodes / {total_steps} steps from {dataset_dir} '
         f'(mix: {manifest["policy_mix"]})',
     )
+    log('DATA', f'{len(validation_rollouts)} held-out episodes for validation')
+    if config.DEVICE.startswith('cuda'):
+        log(
+            'WM',
+            f'GPU {torch_setup.get("gpu_name")} x{torch_setup.get("gpu_count")} '
+            f'cc{torch_setup.get("gpu_capability")} {torch_setup.get("gpu_total_memory_gb")} GB · '
+            f'tf32={torch_setup.get("tf32")} cudnn_benchmark={torch_setup.get("cudnn_benchmark")}',
+        )
+    else:
+        log('WARN', f'running on {config.DEVICE}; this path is for testing, not for real training')
+    if detect_anomaly:
+        log(
+            'WARN',
+            'autograd anomaly detection is ON -- it makes training several times slower. '
+            'Use it only to chase a NaN.',
+        )
 
     with RunLogger(
         run_dir,
@@ -193,11 +226,19 @@ def train(
             environment=env.metadata(),
             passes=passes,
             train_actor_critic=train_actor_critic,
+            torch_setup=torch_setup,
+            train_episodes=len(rollouts),
+            validation_episodes=len(validation_rollouts),
         )
+        # Capture DIMA's own loss curves without touching DIMA.
+        logger.tee_dima_scalars()
 
         from agent.learners.DreamerLearner import DreamerLearner
 
         learner = DreamerLearner(config)
+        # DreamerLearner.__init__ re-enables anomaly detection (line 83); undo it
+        # unless it was explicitly asked for.
+        configure_torch(config.DEVICE, detect_anomaly=detect_anomaly, threads=threads)
         log(
             'WM',
             f'device={config.DEVICE} horizon={config.horizon} '
@@ -220,6 +261,52 @@ def train(
         log('WM', f'checkpoint config -> {sidecar}')
         started = time.time()
         fed_steps = 0
+
+        layout = ObservationLayout.from_env_metadata(env.metadata())
+        validation_set = [
+            ValidationEpisode.from_rollout(r, env) for r in validation_rollouts
+        ]
+        validation_history: List[Dict[str, object]] = []
+        world_model = None
+
+        def run_validation(tag: int) -> None:
+            """Measure the live model on held-out data (see research/validation.py)."""
+
+            nonlocal world_model
+            if not validation_set or learner.train_count == 0:
+                return
+            if world_model is None:
+                from research.world_model import DIMAWorldModel
+
+                world_model = DIMAWorldModel.from_learner(learner, env, config)
+
+            row = validate(
+                world_model,
+                validation_set,
+                layout,
+                num_agents=env.n_agents,
+                num_actions=env.n_actions,
+                sensitivity_samples=sensitivity_samples,
+                seed=seed + tag,
+            )
+            row['pass'] = tag
+            row['train_count'] = learner.train_count
+            row['fed_steps'] = fed_steps
+            validation_history.append(row)
+            logger.records('wm_validation', [row])
+            logger.scalars(
+                {k: v for k, v in row.items() if isinstance(v, (int, float)) and v is not None},
+                step=tag,
+                prefix='val/',
+            )
+            log('WM-DIAG', format_trend(validation_history, ('ade_h1', 'mae_h1', 'sensitivity_ratio')))
+            if row.get('sensitivity_ratio') is not None and row['sensitivity_ratio'] < 1.0:
+                log(
+                    'WARN',
+                    f'action sensitivity ratio {row["sensitivity_ratio"]:.3f} < 1.0 -- changing the '
+                    f'action still moves the prediction less than re-sampling it does, so no '
+                    f'planner can use this model yet.',
+                )
 
         for pass_index in range(passes):
             order = rng.permutation(len(rollouts))
@@ -248,6 +335,9 @@ def train(
                 prefix='wm/',
             )
 
+            if eval_every and (pass_index + 1) % eval_every == 0:
+                run_validation(pass_index + 1)
+
             if save_every and (pass_index + 1) % save_every == 0:
                 path = Path(run_dir) / 'ckpt' / f'model_pass{pass_index + 1:03d}.pth'
                 learner.save(str(path))
@@ -260,7 +350,16 @@ def train(
             fed_steps=fed_steps,
             train_count=learner.train_count,
             buffer_steps=learner.replay_buffer.num_steps,
+            validation=validation_history,
         )
+        if validation_history:
+            log('WM-DIAG', 'validation trend across passes:')
+            for row in validation_history:
+                log(
+                    'WM-DIAG',
+                    f'  pass {row["pass"]:>3}  train_count={row["train_count"]:>4}  '
+                    + format_trend([row], ('ade_h1', 'mae_h1', 'sensitivity_ratio')),
+                )
 
     env.close()
     return checkpoint
@@ -281,6 +380,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--remodel-steps', type=int, default=None)
     parser.add_argument('--train-actor-critic', action='store_true')
     parser.add_argument('--save-every', type=int, default=1)
+    parser.add_argument('--val-episodes', type=int, default=20,
+                        help='episodes held out of training for validation (0 disables)')
+    parser.add_argument('--eval-every', type=int, default=1, help='validate every N passes')
+    parser.add_argument('--sensitivity-samples', type=int, default=4)
+    parser.add_argument('--detect-anomaly', action='store_true',
+                        help='re-enable DIMA\'s autograd anomaly detection (several times slower)')
+    parser.add_argument('--threads', type=int, default=None, help='torch CPU thread count')
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
     return parser.parse_args(argv)
@@ -302,6 +408,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remodel_steps=args.remodel_steps,
         train_actor_critic=args.train_actor_critic,
         save_every=args.save_every,
+        val_episodes=args.val_episodes,
+        eval_every=args.eval_every,
+        sensitivity_samples=args.sensitivity_samples,
+        detect_anomaly=args.detect_anomaly,
+        threads=args.threads,
         wandb_mode=args.wandb_mode,
         tensorboard=args.tensorboard,
     )
