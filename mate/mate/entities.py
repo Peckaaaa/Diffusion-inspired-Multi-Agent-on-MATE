@@ -325,7 +325,7 @@ class Camera(Sensor, Obstacle):  # pylint: disable=too-many-instance-attributes
 
     def reset(self):
         super().reset()
-        self.orientation = self.rotation_step * self.np_random.integers(
+        self.orientation = self.rotation_step * self.np_random.randint(
             low=0, high=360 / self.rotation_step
         )
         self.viewing_angle = self.np_random.uniform(

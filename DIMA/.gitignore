@@ -119,11 +119,7 @@ celerybeat.pid
 .env
 .venv
 venv/
-# NOTE: the usual `ENV/` venv pattern is deliberately absent.  It is anchored to
-# this directory, and on case-insensitive filesystems (Windows, macOS) it also
-# matches this project's own `env/` package -- silently excluding every
-# environment wrapper, including env/mate/MATE.py.  `.venv` and `venv/` above
-# already cover the virtualenv case.
+ENV/
 env.bak/
 venv.bak/
 

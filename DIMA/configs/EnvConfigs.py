@@ -1,9 +1,9 @@
 from configs.Config import Config
-
-# The env backends are imported inside create_env() instead of here: each one
-# pulls in a heavy third-party package (smac, supersuit, gfootball, smacv2,
-# mujoco) and a missing one used to break this module for *every* environment,
-# including those that do not need it.
+from env.starcraft.StarCraft import StarCraft
+from env.pettingzoo.mpe_env import PettingZooMPEEnv
+from env.football.Football import Football
+from env.mamujoco.multiagent_mujoco.mujoco_multi import MujocoMulti
+from env.smacv2.smacv2_env import SMACv2Env
 
 from configs.EnvCurriculum import EnvCurriculum, EnvCurriculumSample, EnvCurriculumPrioritizedSample
 
@@ -22,9 +22,8 @@ class StarCraftConfig(EnvConfig):
         self.seed = seed
 
     def create_env(self):
-        from env.starcraft.StarCraft import StarCraft
         return StarCraft(self.env_name, self.seed)
-
+    
 class SMACv2Config(EnvConfig):
 
     def __init__(self, map_name, seed):
@@ -32,7 +31,6 @@ class SMACv2Config(EnvConfig):
         self.seed = seed
 
     def create_env(self):
-        from env.smacv2.smacv2_env import SMACv2Env
         args = {
             'map_name': self.map_name,
             'seed': self.seed,
@@ -47,7 +45,6 @@ class PettingZooConfig(EnvConfig):
         self.continuous_action = continuous_action
 
     def create_env(self):
-        from env.pettingzoo.mpe_env import PettingZooMPEEnv
         return PettingZooMPEEnv(self.env_name, self.seed, self.continuous_action)
 
 class FootballConfig(EnvConfig):
@@ -56,23 +53,8 @@ class FootballConfig(EnvConfig):
         self.seed = seed
 
     def create_env(self):
-        from env.football.Football import Football
         return Football(self.env_name)
-
-class MATEConfig(EnvConfig):
-    def __init__(self, env_name, seed, levels=5, max_episode_steps=200, reward_scale=10.0):
-        self.env_name = env_name
-        self.seed = seed
-        self.levels = levels
-        self.max_episode_steps = max_episode_steps
-        self.reward_scale = reward_scale
-
-    def create_env(self):
-        from env.mate.MATE import MATEEnv
-        return MATEEnv(self.env_name, self.seed, levels=self.levels,
-                       max_episode_steps=self.max_episode_steps,
-                       reward_scale=self.reward_scale)
-
+    
 class MAMujocoConfig(EnvConfig):
     def __init__(self, scenario, seed, agent_conf, agent_obsk = 0, episode_limit = 1000):
         self.scenario       = scenario
@@ -90,7 +72,6 @@ class MAMujocoConfig(EnvConfig):
         }
 
     def create_env(self):
-        from env.mamujoco.multiagent_mujoco.mujoco_multi import MujocoMulti
         return MujocoMulti(env_args = self.env_args)
 
 # class FlatlandConfig(EnvConfig):

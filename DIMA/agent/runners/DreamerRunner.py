@@ -128,10 +128,6 @@ class DreamerRunner:
                 wandb.log({'rew_per_step': info["reward"], 'steps': cur_steps})
                 LOGGER.log_scalar('metrics/rew_per_step', info["reward"], cur_steps)
                 print("Epi: %4s" % cur_episode, "steps: %5s" % (cur_steps), f"epi_len: {epi_length}", f'Rew per step: {info["reward"]:.4f}', 'Returns: %.4f' % returns, f"Avg std: {ent_str}", sep=' | ')
-            elif self.env_type == Env.MATE:
-                wandb.log({'coverage_rate': info["reward"], 'steps': cur_steps})
-                LOGGER.log_scalar('metrics/coverage_rate', info["reward"], cur_steps)
-                print("Epi: %4s" % cur_episode, "steps: %5s" % (cur_steps), f"epi_len: {epi_length}", f'Coverage: {info["reward"]:.4f}', 'Returns: %.4f' % returns, f"Entropy: {ent_str}", sep=' | ')
             else:
                 wandb.log({'scores': info["reward"], 'steps': cur_steps})
                 LOGGER.log_scalar('metrics/scores', info["reward"], cur_steps)
@@ -171,9 +167,6 @@ class DreamerRunner:
 
                 elif self.env_type == Env.MAMUJOCO or self.env_type == Env.PETTINGZOO:
                     print(f"Steps: {save_interval_steps}, Eval rew per step: {eval_win_rate:.4f}, Eval_returns: {eval_returns:.4f}, Mean episode length {aver_eval_steps}")
-
-                elif self.env_type == Env.MATE:
-                    print(f"Steps: {save_interval_steps}, Eval coverage rate: {eval_win_rate:.4f}, Eval_returns: {eval_returns:.4f}, Mean episode length {aver_eval_steps}")
 
                 else:
                     print(f"Steps: {save_interval_steps}, Eval average scores: {eval_win_rate:.4f}, Eval_returns: {eval_returns:.4f}, Mean episode length {aver_eval_steps}")

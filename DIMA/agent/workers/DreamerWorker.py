@@ -34,9 +34,6 @@ class DreamerWorker:
         elif self.env_type == Env.MAMUJOCO:
             return self.done[handle] == 0
 
-        elif self.env_type == Env.MATE:
-            return self.done[handle] == 0
-
         else:
             raise NotImplementedError(f"{self.env_type} is currently not supported.")
 
@@ -131,10 +128,6 @@ class DreamerWorker:
             state, shared_obs, _ = self.env.reset()
             state = self._wrap(state)
 
-        elif self.env_type == Env.MATE:
-            state, shared_obs, _ = self.env.reset()
-            state = self._wrap(state)
-
         else:
             raise NotImplementedError(f'Currently we donot support {Env.MAMUJOCO} env.')
         
@@ -167,11 +160,6 @@ class DreamerWorker:
             
             elif self.env_type == Env.MAMUJOCO:
                 next_state, next_shared_obs, reward, done, info, _ = self.env.step(actions)
-                rewards_list.append(np.array(self.unwrap(reward)))
-                info_list.append(info)
-
-            elif self.env_type == Env.MATE:
-                next_state, next_shared_obs, reward, done, info, _ = self.env.step([action.argmax().item() for i, action in enumerate(actions)])
                 rewards_list.append(np.array(self.unwrap(reward)))
                 info_list.append(info)
 
@@ -225,10 +213,7 @@ class DreamerWorker:
         elif self.env_type == Env.MAMUJOCO:
             rew_per_step = np.mean(rewards_list)
             reward = rew_per_step
-
-        elif self.env_type == Env.MATE:
-            reward = self.check_coverage(info_list)
-
+        
         return self.controller.dispatch_buffer(), {"idx": self.runner_handle,
                                                    "reward": reward,
                                                    "steps_done": steps_done}
@@ -238,12 +223,5 @@ class DreamerWorker:
         for info in info_list:
             # take agent 0 for example
             score_reward += info[0]['score_reward']
-
+        
         return score_reward
-
-    def check_coverage(self, info_list):
-        # MATE reports the same coverage_rate to every camera, so agent 0 is enough.
-        # The episode metric is its mean over the episode, as in the MATE benchmark.
-        if len(info_list) == 0:
-            return 0.
-        return float(np.mean([info[0]['coverage_rate'] for info in info_list]))

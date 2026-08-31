@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent.runners.DreamerRunner import DreamerRunner
 from configs import Experiment # , SimpleObservationConfig, NearRewardConfig, DeadlockPunishmentConfig, RewardsComposerConfig
-from configs.EnvConfigs import EnvCurriculumConfig, StarCraftConfig, PettingZooConfig, FootballConfig, MAMujocoConfig, SMACv2Config, MATEConfig
+from configs.EnvConfigs import EnvCurriculumConfig, StarCraftConfig, PettingZooConfig, FootballConfig, MAMujocoConfig, SMACv2Config
 
 
 from configs.dreamer.DreamerControllerConfig import DreamerControllerConfig
@@ -28,10 +28,6 @@ from configs.dreamer.football.GRFControllerConfig import GRFDreamerControllerCon
 from configs.dreamer.mamujoco.mamujocoLearnerConfig import MAMujocoDreamerLearnerConfig
 from configs.dreamer.mamujoco.mamujocoControllerConfig import MAMujocoDreamerControllerConfig
 
-# for MATE
-from configs.dreamer.mate.MATELearnerConfig import MATEDreamerLearnerConfig
-from configs.dreamer.mate.MATEControllerConfig import MATEDreamerControllerConfig
-
 
 from environments import Env
 from utils import generate_group_name, format_numel_str_deci
@@ -52,10 +48,6 @@ def parse_args():
     parser.add_argument('--agent_conf', type=str, default=None)
     # specialized arg for MPE
     parser.add_argument('--enable_mpe_disc', action='store_true')
-
-    # specialized args for MATE
-    parser.add_argument('--mate_levels', type=int, default=5, help='DiscreteCamera levels; action size is levels^2')
-    parser.add_argument('--mate_episode_limit', type=int, default=200, help='Overrides max_episode_steps in the MATE scenario')
 
     parser.add_argument('--n_workers', type=int, default=2, help='Number of workers')
     parser.add_argument('--seed', type=int, default=1, help='Number of workers')
@@ -155,16 +147,6 @@ def prepare_football_configs(env_name):
             "reward_config": None,
             "obs_builder_config": None}
 
-def prepare_mate_configs(env_name, levels, episode_limit):
-    agent_configs = [MATEDreamerControllerConfig(), MATEDreamerLearnerConfig()]
-    env_config = MATEConfig(env_name, RANDOM_SEED, levels=levels, max_episode_steps=episode_limit)
-    get_env_info(agent_configs, env_config.create_env())
-    return {"env_config": (env_config, 5000),
-            "controller_config": agent_configs[0],
-            "learner_config": agent_configs[1],
-            "reward_config": None,
-            "obs_builder_config": None}
-
 def prepare_mamujoco_configs(scenario, agent_config):
     agent_configs = [MAMujocoDreamerControllerConfig(), MAMujocoDreamerLearnerConfig()]
     env_config = MAMujocoConfig(scenario = scenario, seed = RANDOM_SEED, agent_conf = agent_config)
@@ -195,8 +177,6 @@ if __name__ == "__main__":
         configs = prepare_football_configs(args.env_name)
     elif args.env == Env.MAMUJOCO:
         configs = prepare_mamujoco_configs(args.env_name, args.agent_conf)
-    elif args.env == Env.MATE:
-        configs = prepare_mate_configs(args.env_name, args.mate_levels, args.mate_episode_limit)
     else:
         raise Exception("Unknown environment")
     

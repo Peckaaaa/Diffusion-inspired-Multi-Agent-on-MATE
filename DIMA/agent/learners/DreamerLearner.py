@@ -814,19 +814,7 @@ class DreamerLearner:
                 done=torch.FloatTensor(data['done'].copy()),                            # (Length, n_agents, 1)
                 filled=torch.ones(data['done'].shape[0], dtype=torch.bool)
             )
-
-        elif self.env_type == Env.MATE:
-            # Same layout as MAMuJoCo/MPE: shared global state, no av_action.
-            episode = MamujocoEpisode(
-                observation=torch.FloatTensor(data['observation'].copy()),              # (Length, n_agents, obs_dim)
-                shared_obs=torch.FloatTensor(data['shared_obs'].copy()),                # (Length, n_agents, state_dim)
-                next_shared_obs=torch.FloatTensor(data['next_shared_obs'].copy()),
-                action=torch.FloatTensor(data['action'].copy()),                        # (Length, n_agents, act_dim)
-                reward=torch.FloatTensor(data['reward'].copy()),                        # (Length, n_agents, 1)
-                done=torch.FloatTensor(data['done'].copy()),                            # (Length, n_agents, 1)
-                filled=torch.ones(data['done'].shape[0], dtype=torch.bool)
-            )
-
+        
         else:
             raise NotImplementedError
 

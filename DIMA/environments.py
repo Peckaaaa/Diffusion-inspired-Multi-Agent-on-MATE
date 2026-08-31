@@ -8,6 +8,5 @@ class Env(str, Enum):
     GRF = "football"
     MAMUJOCO = "mamujoco"
     SMACv2 = "SMACv2"
-    MATE = "mate"
 
 RANDOM_SEED = 23

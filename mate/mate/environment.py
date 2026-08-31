@@ -1222,7 +1222,7 @@ class MultiAgentTracking(gym.Env, EzPickle, metaclass=EnvMeta):
         for entity in itertools.chain(
             self.cameras_ordered, self.targets_ordered, self.obstacles_ordered
         ):
-            seeds.append(entity.seed(int(self.np_random.integers(int_max)))[0])
+            seeds.append(entity.seed(self.np_random.randint(int_max))[0])
 
         return seeds
 
