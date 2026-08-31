@@ -162,6 +162,14 @@ A `[WARN]` fires on every validation where the ratio is still below 1.0.
 * wandb and TensorBoard, via DIMA's own loggers — `--wandb-mode online`,
   `--tensorboard`.
 
+### A preempted run still leaves a model
+
+`--max-hours H` stops after the current episode once the wall-clock budget is
+gone, then finishes the pass, validates, and writes `ckpt/model_final.pth`
+normally. `stopped_early: true` goes into the manifest. `--save-every N` writes
+`model_passNNN.pth` along the way; `ckpt/config.json` is written *before* the
+first save, so even a killed run leaves loadable checkpoints.
+
 ### Checkpoints are self-describing
 
 `ckpt/config.json` is written next to every checkpoint, before the first save, so

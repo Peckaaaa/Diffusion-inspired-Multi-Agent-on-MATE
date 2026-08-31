@@ -131,6 +131,7 @@ def train(
     sensitivity_samples: int = 4,
     detect_anomaly: bool = False,
     threads: Optional[int] = None,
+    max_hours: Optional[float] = None,
     wandb_mode: str = 'disabled',
     tensorboard: bool = False,
 ) -> Path:
@@ -308,9 +309,23 @@ def train(
                     f'planner can use this model yet.',
                 )
 
+        deadline = started + max_hours * 3600.0 if max_hours else None
+        stopped_early = False
+
         for pass_index in range(passes):
             order = rng.permutation(len(rollouts))
             for position, episode_index in enumerate(order):
+                if deadline is not None and time.time() > deadline:
+                    # Break out of the episode loop rather than the process, so the
+                    # checkpoint below is still written: a preempted server run
+                    # should leave a usable model, not nothing.
+                    log(
+                        'WARN',
+                        f'--max-hours {max_hours} reached during pass {pass_index + 1}; '
+                        f'stopping cleanly and saving.',
+                    )
+                    stopped_early = True
+                    break
                 rollout = rollouts[int(episode_index)]
                 learner.step(rollout)
                 fed_steps += len(rollout['done'])
@@ -343,6 +358,9 @@ def train(
                 learner.save(str(path))
                 log('WM', f'checkpoint -> {path}')
 
+            if stopped_early:
+                break
+
         learner.save(str(checkpoint))
         log('WM', f'final checkpoint -> {checkpoint}')
         logger.update_manifest(
@@ -351,6 +369,8 @@ def train(
             train_count=learner.train_count,
             buffer_steps=learner.replay_buffer.num_steps,
             validation=validation_history,
+            stopped_early=stopped_early,
+            wall_seconds=round(time.time() - started, 1),
         )
         if validation_history:
             log('WM-DIAG', 'validation trend across passes:')
@@ -387,6 +407,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--detect-anomaly', action='store_true',
                         help='re-enable DIMA\'s autograd anomaly detection (several times slower)')
     parser.add_argument('--threads', type=int, default=None, help='torch CPU thread count')
+    parser.add_argument('--max-hours', type=float, default=None,
+                        help='stop cleanly and save before this wall-clock budget runs out')
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
     return parser.parse_args(argv)
@@ -413,6 +435,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sensitivity_samples=args.sensitivity_samples,
         detect_anomaly=args.detect_anomaly,
         threads=args.threads,
+        max_hours=args.max_hours,
         wandb_mode=args.wandb_mode,
         tensorboard=args.tensorboard,
     )
