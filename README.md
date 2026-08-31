@@ -147,10 +147,22 @@ visible in the console. The two numbers to watch:
 
 | metric | wanted | meaning |
 |---|---|---|
-| `ade_h1` | ↓ | average displacement error of predicted target positions, MATE units |
+| `sighting_recall_h1` | ↑ | fraction of truly-sighted targets the prediction also sights — **read this first** |
+| `ade_h1` | ↓ | displacement error of predicted target positions, over targets *both* views sight |
 | `sensitivity_ratio` | ↑, and **above 1.0** | action effect vs. diffusion sampling noise; below 1.0 no planner can use the model |
 
 A `[WARN]` fires on every validation where the ratio is still below 1.0.
+
+**Why `sighting_recall` comes first.** A camera observation encodes an unsighted
+target as a zeroed block, so `SceneView` reads its position as the origin. A model
+that never predicts a target as sighted therefore "predicts" every target at
+`(0, 0)`, and a naive displacement error collapses to the mean distance of the
+true targets from the origin — a number that depends only on the environment.
+That is not hypothetical: once the validation seeding was fixed so every pass
+scored the same states, `ade_h1` came out at *exactly* 803.7159 on five
+consecutive passes while `mae_h1` and the sensitivity ratio both moved. ADE and
+FDE are now computed only over targets both views sight, and are `N/A` when
+recall is zero.
 
 ### Everything is recorded, in three places
 
