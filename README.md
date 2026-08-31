@@ -282,6 +282,32 @@ training with a shortened schedule is nowhere near what the paper's setup uses.
 The point is that the diagnostic says so precisely, before any planning result is
 over-interpreted.
 
+### The baseline matrix
+
+`MATE-4v2-9`, 10 episodes × 150 steps, seed 0, `levels=5`, `GreedyTargetAgent`
+opponents. Every row shares scenario, seeds, episode limit and discretisation.
+Higher coverage is better for the camera team; lower *norm target R* is better —
+the two move together, which is a free consistency check on the adapter.
+
+| planner | world model | coverage | transport | norm target R | action entropy | switch rate | redundancy |
+|---|---|---|---|---|---|---|---|
+| `mate_random` | — | 18.13 % ± 12.31 | 85.83 % | +0.0940 | 2.998 | 0.049 | 0.341 |
+| `predictive_greedy` | **dima** | 21.20 % ± 17.75 | 81.48 % | +0.0890 | 3.176 | 0.677 | 0.377 |
+| `naive` | — | 25.23 % ± 16.83 | 77.72 % | +0.0838 | 0.667 | 0.484 | 0.408 |
+| `random` | — | 31.53 % ± 13.40 | 72.98 % | +0.0744 | 3.210 | 0.963 | 0.557 |
+| `reactive_greedy` | — | 53.63 % ± 17.63 | 65.78 % | +0.0515 | 2.631 | 0.256 | 1.472 |
+| `heuristic` | — | 61.93 % ± 19.20 | 65.08 % | +0.0452 | 2.548 | 0.178 | 1.395 |
+
+Maximum action entropy is `ln 25 = 3.219`. The two best planners sit at
+**2.55–2.63** with a **0.18–0.26** switch rate and **~1.4** camera redundancy —
+they commit to a target and hold it. `predictive_greedy` on DIMA sits at
+**3.176** with a **0.677** switch rate: it is acting close to randomly. That is
+the closed-loop fingerprint of the 0.447 sensitivity ratio — candidate utilities
+are near-tied and dominated by diffusion sampling noise, so the argmax jumps
+around. At ±17.75 and ±13.40 over 10 episodes, `predictive_greedy` and `random`
+are **not** statistically separated; what *is* separated is the two rule-based
+baselines, and that is the thing needing explanation.
+
 ### It is the planner, not the model, that limits coverage right now
 
 `MATE-4v2-9`, 150-step episodes, 4 episodes, seed-matched. The middle rows are
@@ -319,15 +345,33 @@ are worth recording because each looked like a world-model failure:
   objective alone gives a camera no gradient while another camera holds the best
   margin.
 
-### The controlled action-information sweep
+### Ranking is what matters, not magnitude
 
-`python -m research.alpha_experiment` runs the same planner against
-`AlphaOracleWorldModel` at α ∈ {0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1}. The curve
-is a step, not a ramp, and the reason is informative: the blend is applied to the
-predicted observation, and a large part of MATE's action-dependent signal lives in
-*binary* visibility flags that `SceneView` thresholds at 0.5. Attenuating a 0/1
-flag towards its mean leaves it below the threshold until α is large. See the
-module docstring for what a follow-up experiment should do instead.
+`python -m research.alpha_experiment`, 3 episodes × 100 steps:
+
+| model | coverage | transport |
+|---|---|---|
+| `random` | 15.50 % ± 7.08 | 88.00 % |
+| α = 0.00 | 28.67 % ± 9.51 | 83.67 % |
+| `reactive_greedy` | 29.83 % ± 19.80 | 83.33 % |
+| α = 0.01 … 0.50 | **35.83 % ± 12.26** | 77.33 % |
+| α = 1.00 (full oracle) | 35.50 % ± 12.03 | 77.33 % |
+
+Every α from 0.01 to 0.50 gives an identical result, and α = 1 differs by 0.33
+points. That is not a coincidence: a linear blend around a shared baseline is a
+positive scaling, so it *preserves the ordering* of the candidates, and the
+planner only takes an `argmax`. So brief section 29's question has a sharper
+answer than expected here: **magnitude barely matters, ordering does.** 1 % of the
+oracle's action signal already beats `reactive_greedy`; 0 % does not. This is
+exactly brief section 26's distinction between good prediction *magnitude* and
+good action *ranking*, confirmed experimentally — and it says the thing to fix
+about DIMA is the sensitivity ratio, not the MAE.
+
+The small step at α = 1 is the binary visibility flags finally crossing the 0.5
+threshold `SceneView` applies. That is also why the curve is a step rather than a
+ramp: the blend runs in observation space, where much of MATE's action-dependent
+signal is binary. See the module docstring for the follow-up that blends in
+utility space instead.
 
 ---
 
