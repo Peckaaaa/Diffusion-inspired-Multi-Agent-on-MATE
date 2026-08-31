@@ -294,6 +294,7 @@ the two move together, which is a free consistency check on the adapter.
 | `mate_random` | — | 18.13 % ± 12.31 | 85.83 % | +0.0940 | 2.998 | 0.049 | 0.341 |
 | `predictive_greedy` | **dima** | 21.20 % ± 17.75 | 81.48 % | +0.0890 | 3.176 | 0.677 | 0.377 |
 | `naive` | — | 25.23 % ± 16.83 | 77.72 % | +0.0838 | 0.667 | 0.484 | 0.408 |
+| `oracle` | **oracle** | 29.67 % ± 9.95 | 72.40 % | +0.0758 | 1.628 | 0.056 | 0.507 |
 | `random` | — | 31.53 % ± 13.40 | 72.98 % | +0.0744 | 3.210 | 0.963 | 0.557 |
 | `reactive_greedy` | — | 53.63 % ± 17.63 | 65.78 % | +0.0515 | 2.631 | 0.256 | 1.472 |
 | `heuristic` | — | 61.93 % ± 19.20 | 65.08 % | +0.0452 | 2.548 | 0.178 | 1.395 |
@@ -307,6 +308,13 @@ are near-tied and dominated by diffusion sampling noise, so the argmax jumps
 around. At ±17.75 and ±13.40 over 10 episodes, `predictive_greedy` and `random`
 are **not** statistically separated; what *is* separated is the two rule-based
 baselines, and that is the thing needing explanation.
+
+The `oracle` row is the same planner class on a *perfect* world model, and it
+reads completely differently: entropy 1.628 and a 0.056 switch rate mean it is
+decisive and consistent — but it still only reaches 29.67 %, with camera
+redundancy 0.507 against `reactive_greedy`'s 1.472. So it is confidently pointing
+the cameras at the wrong thing. The utility and the search are the limit, not the
+predictions.
 
 ### It is the planner, not the model, that limits coverage right now
 
