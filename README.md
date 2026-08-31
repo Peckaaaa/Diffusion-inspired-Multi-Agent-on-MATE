@@ -347,34 +347,37 @@ One CPU training run: 300 episodes / 60 000 steps of mixed-policy data, one pass
 `python -m research.evaluate --planner predictive_greedy --world-model dima
 --checkpoint … --diagnostics`:
 
-| H | MAE | RMSE | ADE | FDE |
-|---|---|---|---|---|
-| 1 | 110.80 | 264.95 | 814.35 | 814.35 |
-| 3 | 112.47 | 267.99 | 774.58 | 772.37 |
-| 5 | 110.61 | 264.84 | 666.83 | 693.91 |
-| 10 | 110.89 | 265.45 | 718.56 | 747.69 |
+| H | MAE | RMSE | ADE | FDE | sighting recall |
+|---|---|---|---|---|---|
+| 1 | 113.84 | 273.37 | N/A | N/A | 0.0000 |
+| 3 | 115.40 | 276.09 | N/A | N/A | 0.0000 |
+| 5 | 114.07 | 273.60 | N/A | N/A | 0.0000 |
+| 10 | 114.11 | 274.91 | N/A | N/A | 0.0000 |
 
 ```
-Action sensitivity   between = 1.854   within (noise) = 4.146   ratio = 0.447
-Per-camera ratio     0.452 / 0.439 / 0.448 / 0.450     max/min = 1.034
+Action sensitivity   between = 1.844   within (noise) = 4.138   ratio = 0.446
+Per-camera ratio     0.441 / 0.452 / 0.448 / 0.442     max/min = 1.020
 Prediction validity  finite 1.00   in-terrain 1.00   angle 1.00   sight-range 1.00
 ```
 
-Three things are worth reading off this, and they are separable *because* the
+Four things are worth reading off this, and they are separable *because* the
 metrics are kept separate:
 
-1. **Ratio 0.447 < 1** — changing the action moves the prediction *less* than
+1. **Sighting recall 0.0000** — the model never predicts a target as sighted, at
+   any horizon. ADE and FDE are therefore `N/A`, not zero: there is no
+   prediction-truth pair to measure a displacement between. Whatever else the
+   model has learned, it has not learned to represent visibility.
+2. **Ratio 0.446 < 1** — changing the action moves the prediction *less* than
    re-sampling the same action does. At this level of training the model is
    action-blind, and no planner built on it can do better than chance about
    actions. This is the metric brief section 23 asks for, and it is the single
    number that explains the closed-loop result below.
-2. **max/min sensitivity 1.034** — the action-blindness is *uniform*, not a
+3. **max/min sensitivity 1.020** — the action-blindness is *uniform*, not a
    conditional-branch imbalance across cameras (brief section 24). That rules out
    a whole class of causes.
-3. **Error is flat in the horizon, and validity is 100 %** — the model is not
+4. **Error is flat in the horizon, and validity is 100 %** — the model is not
    diverging or emitting nonsense; it has collapsed to a plausible,
-   horizon-independent, action-independent prior. ADE ≈ 700 on a 2000×2000
-   terrain means the predicted target positions carry essentially no information.
+   horizon-independent, action-independent prior.
 
 This is an *under-training* result, not a claim about DIMA: one pass of CPU
 training with a shortened schedule is nowhere near what the paper's setup uses.
