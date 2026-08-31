@@ -16,7 +16,8 @@ site below; everything else is inherited from DIMA unchanged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -38,6 +39,10 @@ __all__ = [
     'build_learner_config',
     'default_device',
     'allow_dima_checkpoint_globals',
+    'export_checkpoint_config',
+    'apply_checkpoint_config',
+    'CHECKPOINT_CONFIG_FIELDS',
+    'CHECKPOINT_CONFIG_FILENAME',
 ]
 
 
@@ -156,6 +161,92 @@ class MATEDreamerControllerConfig(_MATEConfigMixin, DreamerControllerConfig):
         super().__init__()
         self._apply_mate_defaults()
         assert self.epsilon == 0.0, 'MATE provides no action mask; epsilon exploration would crash.'
+
+
+#: Config fields that determine module *shapes*, and therefore must match between
+#: the run that wrote a checkpoint and the run that loads it.
+#:
+#: ``horizon`` is the sharp one: it feeds ``trans_config.max_blocks``, which sizes
+#: ``TransRewEndModel``'s positional embedding, causal masks and head slicers.
+#: Training at ``--horizon 5`` and loading with the default 15 fails with a wall of
+#: ``size mismatch`` errors that say nothing about horizons.
+CHECKPOINT_CONFIG_FIELDS = (
+    'horizon',
+    'IN_DIM',
+    'STATE_DIM',
+    'ACTION_SIZE',
+    'NUM_AGENTS',
+    'CONTINUOUS_ACTION',
+    'vq_type',
+    'nums_obs_token',
+    'EMBED_DIM',
+    'OBS_VOCAB_SIZE',
+    'rew_end_model_type',
+    'TRANS_EMBED_DIM',
+    'HEADS',
+    'state_decoder_type',
+    'use_ce_for_cont',
+)
+
+CHECKPOINT_CONFIG_FILENAME = 'config.json'
+
+
+def export_checkpoint_config(config, path) -> 'Path':
+    """Write the shape-determining fields next to a checkpoint.
+
+    Without this, a checkpoint is not self-describing and reloading it depends on
+    the caller happening to pass the same ``--horizon``.
+    """
+
+    from pathlib import Path as _Path
+
+    payload = {field: _jsonable(getattr(config, field)) for field in CHECKPOINT_CONFIG_FIELDS}
+    payload['num_steps_denoising'] = int(config.diffusion_sampler_cfg.num_steps_denoising)
+    payload['num_steps_conditioning'] = int(
+        config.denoiser_cfg.inner_model.num_steps_conditioning
+    )
+
+    destination = _Path(path)
+    destination.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    return destination
+
+
+def apply_checkpoint_config(config, checkpoint_path) -> Optional[Dict[str, Any]]:
+    """Apply the sidecar written by :func:`export_checkpoint_config`, if present.
+
+    Returns the loaded mapping, or ``None`` when the checkpoint has no sidecar
+    (checkpoints written before this existed, or copied without it).
+    """
+
+    from pathlib import Path as _Path
+
+    sidecar = _Path(checkpoint_path).parent / CHECKPOINT_CONFIG_FILENAME
+    if not sidecar.is_file():
+        return None
+
+    payload = json.loads(sidecar.read_text(encoding='utf-8'))
+    for field in CHECKPOINT_CONFIG_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if field == 'state_decoder_type':
+            value = StateDecoderType(value)
+        setattr(config, field, value)
+
+    config.SEQ_LENGTH = config.horizon
+    config.worldmodel_env_cfg.horizon = config.horizon
+    config.trans_config.max_blocks = config.horizon
+    if 'num_steps_denoising' in payload:
+        config.diffusion_sampler_cfg.num_steps_denoising = int(payload['num_steps_denoising'])
+    return payload
+
+
+def _jsonable(value):
+    if isinstance(value, StateDecoderType):
+        return value.value
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
 
 
 def apply_env_info(configs, env: MATEEnv) -> None:

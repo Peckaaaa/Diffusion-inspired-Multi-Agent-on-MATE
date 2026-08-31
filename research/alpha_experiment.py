@@ -17,6 +17,26 @@ is the yardstick a real world model's action sensitivity has to be read against.
 This is **diagnostic only**.  It forks the live environment and never produces
 training data (brief section 29).
 
+Reading the curve: it is a step, and that is informative
+--------------------------------------------------------
+The blend is applied to the predicted **observation vector**, as the brief
+specifies.  But a large share of MATE's action-dependent signal sits in *binary*
+fields -- the per-target and per-teammate visibility flags -- and
+``SceneView.from_joint_observation`` thresholds those at ``0.5``.  Blending a
+0/1 flag towards the mean over candidates leaves it below the threshold until
+``alpha`` is large, so every candidate decodes as "target not sighted", every
+utility ties at the floor, and the planner falls back to its tie-break.  The
+result is a flat curve followed by a step, not a gradual ramp.
+
+That is a real property of the representation, not a defect in the sweep: it
+says the information a world model has to get right on MATE is largely *whether*
+a target lands inside a view cone, which is discontinuous in the action.  A
+follow-up experiment that wants a smooth ramp should attenuate in **utility**
+space instead -- ``u(a) = u_bar + alpha * (u_oracle(a) - u_bar)`` -- which
+measures planner sensitivity to ranking signal without passing through the
+observation decode.  That is deliberately not done here, because it would answer
+a different question than the one the brief asks.
+
     python -m research.alpha_experiment --episodes 3 --max-episode-steps 60
 
 Cost warning: every planner step issues ``num_cameras * num_actions`` real MATE

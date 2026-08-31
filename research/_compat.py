@@ -22,6 +22,7 @@ no-ops on a dependency set that does not need them, so pinning
 from __future__ import annotations
 
 import copy
+import sys
 
 import numpy as np
 
@@ -102,7 +103,17 @@ def _install_gym_legacy_np_random() -> bool:
     semantics are unchanged.
     """
 
-    from gym.utils import seeding
+    try:
+        from gym.utils import seeding
+    except ImportError as exc:  # pragma: no cover - environment problem, not a code path
+        raise ImportError(
+            'gym is not importable, so the DIMA x MATE research layer cannot start.\n'
+            'This almost always means the wrong interpreter is being used -- an IDE '
+            'test runner defaulting to the base environment is the usual cause.\n'
+            '  conda create -n dima python=3.10 && conda activate dima\n'
+            '  pip install -r requirements.txt\n'
+            f'Current interpreter: {sys.executable}'
+        ) from exc
 
     probe, _ = seeding.np_random(0)
     if hasattr(probe, 'randint'):

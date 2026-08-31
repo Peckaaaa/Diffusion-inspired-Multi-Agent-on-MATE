@@ -322,14 +322,25 @@ class DIMAWorldModel(WorldModel):
     ) -> None:
         super().__init__(name)
 
-        from research.config import allow_dima_checkpoint_globals, build_learner_config
+        from research.config import (
+            CHECKPOINT_CONFIG_FILENAME,
+            allow_dima_checkpoint_globals,
+            apply_checkpoint_config,
+            build_learner_config,
+        )
 
         allow_dima_checkpoint_globals()
 
+        explicit_config = config is not None
         if config is None:
             config = build_learner_config(env, device=device)
-        elif device is not None:
+        if device is not None:
             config.DEVICE = device
+
+        # A checkpoint is only loadable with the shapes it was trained at; the
+        # sidecar makes it self-describing.  See research/config.py.
+        sidecar = None if explicit_config else apply_checkpoint_config(config, checkpoint_path)
+        self.checkpoint_config = sidecar
 
         config.CAPACITY = max(2048, config.denoiser_cfg.inner_model.num_steps_conditioning + 8)
         config.load_pretrained = True
@@ -337,7 +348,26 @@ class DIMAWorldModel(WorldModel):
 
         from agent.learners.DreamerLearner import DreamerLearner
 
-        self._learner = DreamerLearner(config)
+        try:
+            self._learner = DreamerLearner(config)
+        except RuntimeError as exc:
+            if 'size mismatch' not in str(exc):
+                raise
+            hint = (
+                f'no {CHECKPOINT_CONFIG_FILENAME} sidecar was found next to the checkpoint, '
+                f'so its training-time shapes are unknown'
+                if sidecar is None
+                else f'the sidecar says {sidecar}'
+            )
+            raise RuntimeError(
+                f'Checkpoint {checkpoint_path} does not match the model built for this run.\n'
+                f'{hint}.\n'
+                f'The usual cause is `horizon`: it sizes TransRewEndModel\'s positional '
+                f'embedding, causal masks and head slicers, so a model trained with '
+                f'--horizon H can only be loaded at the same H (this run built '
+                f'horizon={config.horizon}).\n'
+                f'Original error: {exc}'
+            ) from exc
         # DreamerLearner.__init__ turns on global anomaly detection for training;
         # this object only ever runs forward passes.
         torch.autograd.set_detect_anomaly(False)
@@ -455,6 +485,17 @@ class DIMAWorldModel(WorldModel):
         rew_out = np.zeros((total, horizon), dtype=np.float32) if with_reward else None
         cont_out = np.zeros((total, horizon), dtype=np.float32) if with_reward else None
 
+        # TransRewEndModel's positional embedding and causal masks are sized for
+        # `max_blocks` steps (= the training horizon), and each imagined step
+        # appends one block to the KV cache.  Rolling the *state* further is fine
+        # -- the denoiser has no such limit -- so reward/termination is reported
+        # for the first `max_blocks` steps and NaN afterwards, rather than
+        # silently truncating the rollout or crashing inside the transformer.
+        reward_steps = min(horizon, int(self.rew_end_model.config.max_blocks))
+        if with_reward and reward_steps < horizon:
+            rew_out[:, reward_steps:] = np.nan
+            cont_out[:, reward_steps:] = np.nan
+
         kv_cache = attn_mask = None
         if with_reward:
             kv_cache, attn_mask = self._fresh_rew_end_cache(total)
@@ -463,7 +504,7 @@ class DIMAWorldModel(WorldModel):
             step_action = np.repeat(action_seq[:, h], samples, axis=0)  # (total, C)
             act_buffer[:, -1] = self._one_hot(step_action[:, None, :])[:, 0]
 
-            if with_reward:
+            if with_reward and h < reward_steps:
                 rew, cont, kv_cache, attn_mask = self._predict_rew_end(
                     state_buffer, act_buffer, kv_cache, attn_mask
                 )
@@ -514,6 +555,8 @@ class DIMAWorldModel(WorldModel):
                 'observation_units': 'mate',
                 'state_units': 'rms-normalized',
                 'reward_context': 'per-call transformer cache (no cross-step burn-in)',
+                'reward_steps': reward_steps if with_reward else 0,
+                'max_reward_blocks': int(self.rew_end_model.config.max_blocks),
             },
         )
 

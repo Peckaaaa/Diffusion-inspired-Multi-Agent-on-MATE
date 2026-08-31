@@ -241,12 +241,93 @@ MATE's internally-computed `info['coverage_rate']` to 9 decimal places at every
 step (`tests/test_research.py:TestSceneView`). The rescale ↔ un-rescale round trip
 is exact to ~1e-13.
 
-### The planner interface works when the model is perfect
+### The trained world model is action-blind
 
-`ModelBasedGreedyPlanner` driven by `OracleWorldModel` beats `RandomPlanner` on
-coverage (`tests/test_research.py:TestOraclePlannerBeatsRandom`). Same planner
-class, same code path, only the world model swapped — which is what makes
-"is it the model or the planner?" answerable.
+One CPU training run: 300 episodes / 60 000 steps of mixed-policy data, one pass,
+`--horizon 5`, 28 `DreamerLearner.step` training rounds, ~35 min. Diagnostics from
+`python -m research.evaluate --planner predictive_greedy --world-model dima
+--checkpoint … --diagnostics`:
+
+| H | MAE | RMSE | ADE | FDE |
+|---|---|---|---|---|
+| 1 | 110.80 | 264.95 | 814.35 | 814.35 |
+| 3 | 112.47 | 267.99 | 774.58 | 772.37 |
+| 5 | 110.61 | 264.84 | 666.83 | 693.91 |
+| 10 | 110.89 | 265.45 | 718.56 | 747.69 |
+
+```
+Action sensitivity   between = 1.854   within (noise) = 4.146   ratio = 0.447
+Per-camera ratio     0.452 / 0.439 / 0.448 / 0.450     max/min = 1.034
+Prediction validity  finite 1.00   in-terrain 1.00   angle 1.00   sight-range 1.00
+```
+
+Three things are worth reading off this, and they are separable *because* the
+metrics are kept separate:
+
+1. **Ratio 0.447 < 1** — changing the action moves the prediction *less* than
+   re-sampling the same action does. At this level of training the model is
+   action-blind, and no planner built on it can do better than chance about
+   actions. This is the metric brief section 23 asks for, and it is the single
+   number that explains the closed-loop result below.
+2. **max/min sensitivity 1.034** — the action-blindness is *uniform*, not a
+   conditional-branch imbalance across cameras (brief section 24). That rules out
+   a whole class of causes.
+3. **Error is flat in the horizon, and validity is 100 %** — the model is not
+   diverging or emitting nonsense; it has collapsed to a plausible,
+   horizon-independent, action-independent prior. ADE ≈ 700 on a 2000×2000
+   terrain means the predicted target positions carry essentially no information.
+
+This is an *under-training* result, not a claim about DIMA: one pass of CPU
+training with a shortened schedule is nowhere near what the paper's setup uses.
+The point is that the diagnostic says so precisely, before any planning result is
+over-interpreted.
+
+### It is the planner, not the model, that limits coverage right now
+
+`MATE-4v2-9`, 150-step episodes, 4 episodes, seed-matched. The middle rows are
+the *same planner class* with the world model swapped:
+
+| planner | world model | coverage |
+|---|---|---|
+| `random` | — | 18.58 % ± 6.80 |
+| `oracle` (`local_weight=0`) | oracle (real MATE) | 26.58 % ± 7.07 |
+| `oracle` (`local_weight=0.25`) | oracle (real MATE) | 32.25 % ± 11.76 |
+| `reactive_greedy` | — | 42.42 % ± 17.65 |
+| `heuristic` | — | 48.33 % ± 14.90 |
+
+**With a perfect world model the model-based planner still loses to MATE's
+rule-based greedy agent.** So the current bottleneck is the planner's utility and
+search, not prediction quality — exactly the discrimination brief section 28 asks
+for, and exactly why brief section 35 warns against assuming a better world model
+means better coordination. `GreedyCameraAgent` solves analytically for the
+orientation *and* the viewing-angle/sight-range trade-off that centres the nearest
+target; `ModelBasedGreedyPlanner` picks the best of 25 discrete moves under a
+hand-written margin proxy, one camera at a time, one step ahead.
+
+Two planner defects were found by measurement rather than by inspection, and both
+are worth recording because each looked like a world-model failure:
+
+* **Scoring only sighted targets froze the planner.** MATE's cameras start pointed
+  at empty terrain, so nothing was sighted, every candidate action tied at the
+  utility floor, and the planner never moved — for *every* world model, including
+  the oracle, which is why the first α-sweep was a flat line. Fixed with
+  `TargetMemory`, modelled on `GreedyCameraAgent`'s own `memory`/`time2forget`.
+* **Clipping the margin at −1 removed the gradient for distant cameras.** Measured:
+  two of four cameras had an *exactly zero* utility spread on 100 % of planning
+  steps. `SceneView.margin_to` is now unclipped below. With that fixed,
+  `local_weight` starts to matter too (26.58 % → 32.25 %), because the team-max
+  objective alone gives a camera no gradient while another camera holds the best
+  margin.
+
+### The controlled action-information sweep
+
+`python -m research.alpha_experiment` runs the same planner against
+`AlphaOracleWorldModel` at α ∈ {0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1}. The curve
+is a step, not a ramp, and the reason is informative: the blend is applied to the
+predicted observation, and a large part of MATE's action-dependent signal lives in
+*binary* visibility flags that `SceneView` thresholds at 0.5. Attenuating a 0/1
+flag towards its mean leaves it below the threshold until α is large. See the
+module docstring for what a follow-up experiment should do instead.
 
 ---
 
@@ -262,18 +343,35 @@ class, same code path, only the world model swapped — which is what makes
    `predict()` call, because candidate-action search would otherwise pollute a
    shared one. Predicted reward is therefore conditioned on the current step only.
    It is reported as a diagnostic and is not the planner's default utility.
-4. **The oracle is one sample.** MATE's targets and its obstacle-transmittance checks
+   Reward/termination is also only defined for the first `trans_config.max_blocks`
+   imagined steps (the training horizon); beyond that it is `NaN`, while the state
+   rollout continues normally.
+4. **A checkpoint is only loadable at its training horizon.** `horizon` sizes
+   `TransRewEndModel`'s positional embedding, masks and head slicers.
+   `train_wm.py` writes `ckpt/config.json` beside every checkpoint and
+   `DIMAWorldModel` reads it, so this is handled — but a checkpoint copied away
+   from that sidecar will fail to load, with an error that says why.
+5. **Planner utility is a proxy.** The default `soft_coverage` margin is defined in
+   `research/views.py`, not taken from MATE. MATE's own `soft_coverage_score`
+   needs a live `Camera` entity's `boundary_between`, which cannot be recovered
+   from a *predicted* observation. Reported coverage always comes from MATE.
+6. **The oracle is one sample.** MATE's targets and its obstacle-transmittance checks
    are stochastic and a fork advances its own RNG, so `OracleWorldModel` returns one
    sample of the real dynamics, not the branch the live episode will take.
-5. **Action ranking needs a forkable state.** `compute_action_ranking` compares a
+7. **Action ranking needs a forkable state.** `compute_action_ranking` compares a
    model against the oracle at a live state; it cannot be evaluated from a logged
-   transition, and prints `N/A` there.
-6. **Search is coordinate descent.** `ModelBasedGreedyPlanner` does one sweep of
+   transition, and prints `N/A` there — which is why the DIMA diagnostics block
+   above shows `N/A` for the whole ranking section.
+8. **Search is coordinate descent.** `ModelBasedGreedyPlanner` does one sweep of
    `C × |A|` queries rather than searching all `|A|^C = 390 625` joint actions.
-7. **`mate.evaluate --camera-discrete-levels` is broken upstream** for rule-based
+9. **`mate.evaluate --camera-discrete-levels` is broken upstream** for rule-based
    camera agents (they emit continuous actions that `DiscreteCamera.action` rejects).
    Unrelated to this project; noted because it blocks the obvious cross-check.
-8. **CPU is the tested path.** The training numbers here come from a CPU run with a
+10. **Episode budgets here are small.** Coverage on `MATE-4v2-9` has a per-episode
+   standard deviation of 15–22 points, so the 3–10 episode runs above separate
+   only large differences. Treat the closed-loop table as an ordering check, not
+   as a benchmark.
+11. **CPU is the tested path.** The training numbers here come from a CPU run with a
    deliberately shortened schedule.
 
 ---

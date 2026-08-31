@@ -39,7 +39,12 @@ import numpy as np
 import research  # noqa: F401 - installs sys.path + compat shims
 
 from research.collect import load_dataset
-from research.config import allow_dima_checkpoint_globals, build_learner_config
+from research.config import (
+    CHECKPOINT_CONFIG_FILENAME,
+    allow_dima_checkpoint_globals,
+    build_learner_config,
+    export_checkpoint_config,
+)
 from research.env_adapter import MATEEnv
 from research.logging_utils import RunLogger, log
 
@@ -207,6 +212,12 @@ def train(
 
         rng = np.random.default_rng(seed)
         checkpoint = Path(run_dir) / 'ckpt' / 'model_final.pth'
+        # Written once, up front, so every checkpoint in this directory -- including
+        # the intermediate ones -- is self-describing even if the run is killed.
+        sidecar = export_checkpoint_config(
+            config, Path(run_dir) / 'ckpt' / CHECKPOINT_CONFIG_FILENAME
+        )
+        log('WM', f'checkpoint config -> {sidecar}')
         started = time.time()
         fed_steps = 0
 

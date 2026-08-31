@@ -258,18 +258,95 @@ class RandomPlanner(Planner):
 # --------------------------------------------------------------------------- #
 
 
-def _coverage_utility(view: SceneView) -> float:
-    return view.coverage_estimate()
+class TargetMemory:
+    """Last-known target positions, with forgetting -- MATE's own trick.
+
+    ``GreedyCameraAgent`` keeps ``self.memory`` of target states plus a
+    ``time2forget`` countdown, and aims at what it remembers rather than at what
+    it can see right now (``mate/agents/greedy.py:43-114``).  A model-based
+    planner needs the same thing for a more basic reason: if the utility only
+    scores *sighted* targets, then a camera that sees nothing gets the same score
+    for every action, every candidate ties, and the planner never moves.  That is
+    a planner failure that looks exactly like a world-model failure, which is
+    precisely the confusion this project exists to prevent.
+
+    The memory is built from the camera team's own joint observation, so it adds
+    no privileged information.
+    """
+
+    def __init__(self, num_targets: int, memory_period: int = 25) -> None:
+        self.num_targets = num_targets
+        self.memory_period = memory_period
+        self.positions = np.zeros((num_targets, 2), dtype=np.float64)
+        self.time2forget = np.zeros(num_targets, dtype=np.int64)
+        self.ever_seen = np.zeros(num_targets, dtype=bool)
+
+    def reset(self) -> None:
+        self.positions[:] = 0.0
+        self.time2forget[:] = 0
+        self.ever_seen[:] = False
+
+    def update(self, view: SceneView) -> None:
+        self.time2forget = np.maximum(self.time2forget - 1, 0)
+        for target in np.flatnonzero(view.target_sighted):
+            self.positions[target] = view.target_positions[target]
+            self.time2forget[target] = self.memory_period
+            self.ever_seen[target] = True
+
+    @property
+    def live(self) -> np.ndarray:
+        """Targets worth aiming at: seen recently enough not to be forgotten."""
+
+        return self.time2forget > 0
+
+    def positions_for(self, view: SceneView) -> np.ndarray:
+        """Where to aim, preferring what a (possibly predicted) view can see."""
+
+        positions = self.positions.copy()
+        sighted = view.target_sighted
+        positions[sighted] = view.target_positions[sighted]
+        return positions
 
 
-def _soft_coverage_utility(view: SceneView) -> float:
-    return view.soft_coverage_estimate()
+def _coverage_utility(view: SceneView, targets: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if not mask.any():
+        return np.zeros((view.num_cameras, 0), dtype=np.float64)
+    return view.margin_to(targets[mask])
 
 
-UTILITIES: Dict[str, Callable[[SceneView], float]] = {
+#: Utility functions return the ``(num_cameras, num_live_targets)`` margin matrix
+#: that :meth:`ModelBasedGreedyPlanner._score` reduces.  The target positions come
+#: from the planner's :class:`TargetMemory`, not from the view, so that turning
+#: *towards* a currently unseen target is rewarded.
+UTILITIES: Dict[str, Callable[[SceneView, np.ndarray, np.ndarray], np.ndarray]] = {
     'coverage': _coverage_utility,
-    'soft_coverage': _soft_coverage_utility,
+    'soft_coverage': _coverage_utility,
 }
+
+
+def _reduce_margins(margins: np.ndarray, hard: bool, camera: int, local_weight: float) -> float:
+    """Team score for one candidate, plus an optional local term for ``camera``.
+
+    The team score is ``mean over targets of the best camera's margin`` -- the
+    right objective, since MATE counts a target as covered if *any* camera sees it.
+
+    Under coordinate descent that objective has a defect worth naming: while
+    camera A holds the best margin on the only live target, cameras B, C and D
+    change nothing by moving, so their candidate utilities are all equal, the
+    tie-break holds them still, and three quarters of the team stops searching.
+    ``local_weight`` adds that camera's own best margin, scaled, so every camera
+    keeps a gradient.  It is a planner design choice, not a fact about MATE, so it
+    is configurable and its effect is measured rather than assumed
+    (``--local-weight 0`` recovers the pure team objective).
+    """
+
+    if margins.shape[1] == 0:
+        return 0.0
+    best = margins.max(axis=0)
+    team = float((best >= 0.0).mean()) if hard else float(best.mean())
+    if local_weight == 0.0:
+        return team
+    return team + local_weight * float(margins[camera].max())
 
 
 class ModelBasedGreedyPlanner(Planner):
@@ -294,13 +371,23 @@ class ModelBasedGreedyPlanner(Planner):
     Utility
     -------
     The world model returns predicted *observations* in MATE units.  Those are
-    turned into a :class:`~research.views.SceneView` and scored with
-    ``soft_coverage`` by default (see
-    :meth:`~research.views.SceneView.soft_coverage_estimate`).  ``coverage``
-    (hard) and any callable are also accepted.  Predicted reward is recorded as a
-    diagnostic but is not the default utility: DIMA's reward head is trained on
-    MATE's raw team reward, which is zero on most steps and therefore a poor
-    action discriminator early in training.
+    decoded into a :class:`~research.views.SceneView`, and the predicted camera
+    geometry is scored against the target positions in :class:`TargetMemory` --
+    the predicted position when the prediction sights the target, the last known
+    position otherwise.  Scoring only *sighted* targets does not work: MATE's
+    cameras start pointed away from the centre, so nothing is sighted, every
+    candidate action ties, and the planner freezes on its tie-break while looking
+    like a world-model failure.  See :class:`TargetMemory`.
+
+    Default utility is ``soft_coverage`` (mean over live targets of the best
+    camera's normalised field-of-view margin); ``coverage`` (hard) and any
+    callable are also accepted.  Predicted reward is recorded as a diagnostic but
+    is not the default utility: DIMA's reward head is trained on MATE's raw team
+    reward, which is zero on most steps and therefore a poor action discriminator.
+
+    When no target has ever been seen there is genuinely nothing to plan for, and
+    the planner falls back to MATE's own exploration rule -- resample with
+    probability 0.1, otherwise hold (``mate/agents/greedy.py:93-96``).
     """
 
     USES_WORLD_MODEL = True
@@ -314,6 +401,9 @@ class ModelBasedGreedyPlanner(Planner):
         sweeps: int = 1,
         utility: str = 'soft_coverage',
         discount: float = 1.0,
+        memory_period: int = 25,
+        exploration_prob: float = 0.1,
+        local_weight: float = 0.25,
         seed: int = 0,
         name: Optional[str] = None,
     ) -> None:
@@ -322,7 +412,10 @@ class ModelBasedGreedyPlanner(Planner):
         self.horizon = max(1, int(horizon))
         self.sweeps = max(1, int(sweeps))
         self.discount = float(discount)
+        self.exploration_prob = float(exploration_prob)
+        self.local_weight = float(local_weight)
         self.utility_name = utility if isinstance(utility, str) else getattr(utility, '__name__', 'custom')
+        self._hard = utility == 'coverage'
         self._utility = UTILITIES[utility] if isinstance(utility, str) else utility
 
         self.USES_PRIVILEGED_STATE = world_model.uses_privileged_state
@@ -330,14 +423,52 @@ class ModelBasedGreedyPlanner(Planner):
         self._num_actions = env.n_actions
         self._num_cameras = env.n_agents
         self._rng = np.random.default_rng(seed)
-        self._base_action = np.full(self._num_cameras, env.discrete_levels**2 // 2, dtype=np.int64)
+        self._noop = env.discrete_levels**2 // 2
+        # Search action: maximum rotation, widest viewing angle -- a sweep.  Read
+        # off DiscreteCamera's own grid rather than hardcoded, so it stays correct
+        # for any `levels`.  This is MATE's NaiveCameraAgent behaviour ("rotates
+        # anti-clockwise with the maximum viewing angle", mate/agents/naive.py:12),
+        # used only when there is no target to plan for.
+        self._scan_action = int(np.lexsort((env.action_grid[:, 1], env.action_grid[:, 0]))[-1])
+        self._base_action = np.full(self._num_cameras, self._scan_action, dtype=np.int64)
+        self._memory = TargetMemory(env.n_targets, memory_period=memory_period)
 
     def reset(self, observation: MATEObservation, context: PlanContext) -> None:
-        self._base_action = np.full(context.num_cameras, self._num_actions // 2, dtype=np.int64)
+        self._base_action = np.full(context.num_cameras, self._scan_action, dtype=np.int64)
+        self._memory.reset()
+        self._memory.update(
+            SceneView.from_joint_observation(observation.obs_raw, context.layout)
+        )
 
     def plan(self, observation, prediction, context) -> np.ndarray:
         if context.history is None:
             raise ValueError('ModelBasedGreedyPlanner needs PlanContext.history.')
+
+        self._memory.update(
+            SceneView.from_joint_observation(observation.obs_raw, context.layout)
+        )
+        live = self._memory.live
+
+        if not live.any():
+            # Nothing to track, so there is nothing for a world model to say and
+            # no utility to maximise.  Sweep, and occasionally resample -- the
+            # same structure as GreedyCameraAgent's no-target branch
+            # (mate/agents/greedy.py:92-96), with a scan instead of a hold so a
+            # camera that starts pointed at empty terrain actually searches.
+            if self._rng.random() < self.exploration_prob:
+                self._base_action = self._rng.integers(
+                    0, self._num_actions, size=context.num_cameras
+                ).astype(np.int64)
+            self._diagnostics = {
+                'predicted_utility': float('nan'),
+                'base_utility': float('nan'),
+                'utility_spread_per_camera': {},
+                'utility': self.utility_name,
+                'horizon': self.horizon,
+                'live_targets': 0,
+                'mode': 'explore',
+            }
+            return self._base_action.copy()
 
         joint = self._base_action.copy()
         scored: Dict[int, np.ndarray] = {}
@@ -351,30 +482,38 @@ class ModelBasedGreedyPlanner(Planner):
                 pred = self.world_model.predict(
                     context.history, candidates, horizon=self.horizon
                 )
-                utilities = self._score(pred, context)
+                utilities = self._score(pred, context, live, camera)
                 scored[camera] = utilities
 
-                best = int(np.argmax(utilities))
                 if base_utility is None:
                     base_utility = float(utilities[joint[camera]])
-                joint[camera] = best
+                # A flat utility means the model sees no difference between this
+                # camera's actions; holding is honest, moving to index 0 is not.
+                if np.ptp(utilities) > 0.0:
+                    joint[camera] = int(np.argmax(utilities))
 
         self._base_action = joint.copy()
 
-        per_camera_spread = {
-            f'camera_{c}': float(np.ptp(u)) for c, u in scored.items()
-        }
         final_utilities = scored.get(context.num_cameras - 1)
         self._diagnostics = {
-            'predicted_utility': float(final_utilities.max()) if final_utilities is not None else float('nan'),
+            'predicted_utility': float(final_utilities.max())
+            if final_utilities is not None
+            else float('nan'),
             'base_utility': base_utility if base_utility is not None else float('nan'),
-            'utility_spread_per_camera': per_camera_spread,
+            'utility_spread_per_camera': {
+                f'camera_{c}': float(np.ptp(u)) for c, u in scored.items()
+            },
             'utility': self.utility_name,
+            'local_weight': self.local_weight,
             'horizon': self.horizon,
+            'live_targets': int(live.sum()),
+            'mode': 'plan',
         }
         return joint
 
-    def _score(self, prediction: Prediction, context: PlanContext) -> np.ndarray:
+    def _score(
+        self, prediction: Prediction, context: PlanContext, live: np.ndarray, camera: int
+    ) -> np.ndarray:
         """Discounted sum of per-step utility over the prediction horizon."""
 
         num_candidates, horizon = prediction.observations.shape[:2]
@@ -386,7 +525,9 @@ class ModelBasedGreedyPlanner(Planner):
                 view = SceneView.from_joint_observation(
                     prediction.observations[b, h], context.layout
                 )
-                total += weight * self._utility(view)
+                targets = self._memory.positions_for(view)
+                margins = self._utility(view, targets, live)
+                total += weight * _reduce_margins(margins, self._hard, camera, self.local_weight)
                 weight *= self.discount
             utilities[b] = total
         return utilities

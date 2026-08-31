@@ -187,6 +187,42 @@ class SceneView:
             return 0.0
         return float(self.tracking_matrix().any(axis=0).sum()) / float(self.num_targets)
 
+    def margin_to(self, target_positions: np.ndarray) -> np.ndarray:
+        """``(C, K)`` field-of-view margin to *arbitrary* positions, unclipped below.
+
+        Same geometry as :meth:`margin_matrix`, but scoring positions the caller
+        supplies instead of the ones this view happens to have observed.  A
+        planner needs this: a camera cannot be rewarded for turning *towards* a
+        target it cannot currently see, so the utility has to be evaluated
+        against remembered positions, exactly as MATE's own ``GreedyCameraAgent``
+        aims at ``self.memory`` rather than at what it sees this instant
+        (``mate/agents/greedy.py:81-99``).
+
+        Unlike :meth:`margin_matrix` this is **not** clipped at ``-1``.  That clip
+        is right for a bounded *score* and wrong for a planning *gradient*: a
+        camera whose target is more than one sight-range away saturates at ``-1``
+        for every action it could take, its candidate utilities all tie, and it
+        stops moving.  Measured on MATE-4v2-9, clipping left two of four cameras
+        with an exactly-zero utility spread on 100% of planning steps.  Only the
+        upper bound is kept, so "already well inside the view cone" still saturates.
+        """
+
+        positions = np.atleast_2d(np.asarray(target_positions, dtype=np.float64))
+        if positions.size == 0:
+            return np.zeros((self.num_cameras, 0), dtype=np.float64)
+
+        delta = positions[np.newaxis, :, :] - self.camera_positions[:, np.newaxis, :]
+        distance = np.linalg.norm(delta, axis=-1)
+        bearing = np.rad2deg(np.arctan2(delta[..., 1], delta[..., 0]))
+        offset = np.abs(((bearing - self.camera_orientations[:, np.newaxis]) + 180.0) % 360.0 - 180.0)
+
+        half_angle = np.maximum(self.camera_viewing_angles[:, np.newaxis] / 2.0, 1e-6)
+        sight = np.maximum(self.camera_sight_ranges[:, np.newaxis], 1e-6)
+
+        angular = 1.0 - offset / half_angle
+        radial = 1.0 - distance / sight
+        return np.minimum(np.minimum(angular, radial), 1.0)
+
     def margin_matrix(self) -> np.ndarray:
         """``(C, T)`` float: normalised margin to camera ``c``'s field-of-view boundary.
 
