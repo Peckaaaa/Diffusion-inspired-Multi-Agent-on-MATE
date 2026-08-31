@@ -184,6 +184,7 @@ def validate(
         row[f'rmse_h{horizon}'] = stat.rmse
         row[f'ade_h{horizon}'] = stat.ade
         row[f'coverage_mae_h{horizon}'] = stat.coverage_mae
+        row[f'sighting_recall_h{horizon}'] = stat.sighting_recall
 
     if measured:
         row['sensitivity_states'] = len(measured)

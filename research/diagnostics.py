@@ -66,6 +66,24 @@ class PredictionErrorStats:
     / ``fde`` are average and final *displacement* errors of the target
     positions, in MATE distance units -- the quantity a tracking planner actually
     cares about, and the reason the raw MAE alone is not enough.
+
+    Read ``sighting_recall`` before reading ``ade``
+    -----------------------------------------------
+    A camera observation encodes an unsighted target as a zeroed block, so
+    :class:`~research.views.SceneView` reports its position as the origin. If the
+    world model never predicts a target as sighted, the "predicted position" is
+    therefore always ``(0, 0)`` and a naive displacement error collapses to the
+    mean distance of the true targets from the origin -- a number that depends
+    only on the environment and does not move when the model improves. Measured
+    on an under-trained checkpoint, that produced an ``ade`` frozen at 803.7159
+    across every validation pass while ``mae`` and the sensitivity ratio both
+    moved.
+
+    So ``ade`` / ``fde`` here are computed over targets that **both** the
+    prediction and the truth sight, which makes them genuinely model-dependent,
+    and they are ``None`` when the model sights nothing. ``sighting_recall`` --
+    the fraction of truth-sighted targets the prediction also marks sighted --
+    says which case you are in.
     """
 
     horizon: int
@@ -75,6 +93,7 @@ class PredictionErrorStats:
     ade: Optional[float] = None
     fde: Optional[float] = None
     coverage_mae: Optional[float] = None
+    sighting_recall: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -85,6 +104,7 @@ class PredictionErrorStats:
             'ade': self.ade,
             'fde': self.fde,
             'coverage_mae': self.coverage_mae,
+            'sighting_recall': self.sighting_recall,
         }
 
 
@@ -108,27 +128,34 @@ def compute_prediction_error(
     mae = float(np.abs(residual).mean())
     rmse = float(np.sqrt(np.square(residual).mean()))
 
-    # Displacement errors are computed on the decoded target positions, using
-    # only targets the ground truth actually sighted -- unsighted targets carry a
-    # zeroed placeholder position and would otherwise dominate the average.
-    displacements: List[np.ndarray] = []
-    final_displacements: List[np.ndarray] = []
+    # Displacement errors use only targets BOTH views sight; see the class
+    # docstring for why scoring truth-sighted targets alone degenerates.
+    displacements: List[float] = []
+    final_displacements: List[float] = []
     coverage_errors: List[float] = []
+    recalls: List[float] = []
 
     for n in range(count):
         per_step: List[float] = []
         for h in range(horizon):
             pred_view = SceneView.from_joint_observation(predicted[n, h], layout)
             true_view = SceneView.from_joint_observation(actual[n, h], layout)
-            visible = true_view.target_sighted
-            if visible.any():
-                delta = pred_view.target_positions[visible] - true_view.target_positions[visible]
-                per_step.append(float(np.linalg.norm(delta, axis=-1).mean()))
+
+            truth_sighted = true_view.target_sighted
+            if truth_sighted.any():
+                agreed = np.logical_and(truth_sighted, pred_view.target_sighted)
+                recalls.append(float(agreed.sum()) / float(truth_sighted.sum()))
+                if agreed.any():
+                    delta = (
+                        pred_view.target_positions[agreed] - true_view.target_positions[agreed]
+                    )
+                    per_step.append(float(np.linalg.norm(delta, axis=-1).mean()))
+
             coverage_errors.append(
                 abs(pred_view.coverage_estimate() - true_view.coverage_estimate())
             )
         if per_step:
-            displacements.append(np.mean(per_step))
+            displacements.append(float(np.mean(per_step)))
             final_displacements.append(per_step[-1])
 
     return PredictionErrorStats(
@@ -139,6 +166,7 @@ def compute_prediction_error(
         ade=float(np.mean(displacements)) if displacements else None,
         fde=float(np.mean(final_displacements)) if final_displacements else None,
         coverage_mae=float(np.mean(coverage_errors)) if coverage_errors else None,
+        sighting_recall=float(np.mean(recalls)) if recalls else None,
     )
 
 
@@ -525,13 +553,20 @@ def format_world_model_report(
 
     lines: List[str] = ['', 'WORLD MODEL DIAGNOSTICS', '=' * 60, '', 'Prediction error:']
     if errors:
-        lines.append(f'  {"H":>4}  {"count":>6}  {"MAE":>10}  {"RMSE":>10}  {"ADE":>10}  {"FDE":>10}')
+        lines.append(
+            f'  {"H":>4}  {"count":>6}  {"MAE":>10}  {"RMSE":>10}  {"ADE":>10}  {"FDE":>10}'
+            f'  {"sight.recall":>12}'
+        )
         for horizon in sorted(errors):
             stat = errors[horizon]
             lines.append(
                 f'  {horizon:>4}  {stat.count:>6}  {_fmt(stat.mae):>10}  {_fmt(stat.rmse):>10}  '
-                f'{_fmt(stat.ade):>10}  {_fmt(stat.fde):>10}'
+                f'{_fmt(stat.ade):>10}  {_fmt(stat.fde):>10}  {_fmt(stat.sighting_recall):>12}'
             )
+        lines.append(
+            '  ADE/FDE cover only targets both the prediction and the truth sight; '
+            'a 0.0000 recall means they are N/A, not that positions are perfect.'
+        )
     else:
         lines.append(f'  {_NA}')
 

@@ -303,7 +303,13 @@ def train(
                 step=tag,
                 prefix='val/',
             )
-            log('WM-DIAG', format_trend(validation_history, ('ade_h1', 'mae_h1', 'sensitivity_ratio')))
+            log(
+                'WM-DIAG',
+                format_trend(
+                    validation_history,
+                    ('ade_h1', 'sighting_recall_h1', 'mae_h1', 'sensitivity_ratio'),
+                ),
+            )
             if row.get('sensitivity_ratio') is not None and row['sensitivity_ratio'] < 1.0:
                 log(
                     'WARN',
@@ -381,7 +387,9 @@ def train(
                 log(
                     'WM-DIAG',
                     f'  pass {row["pass"]:>3}  train_count={row["train_count"]:>4}  '
-                    + format_trend([row], ('ade_h1', 'mae_h1', 'sensitivity_ratio')),
+                    + format_trend(
+                        [row], ('ade_h1', 'sighting_recall_h1', 'mae_h1', 'sensitivity_ratio')
+                    ),
                 )
 
     env.close()
