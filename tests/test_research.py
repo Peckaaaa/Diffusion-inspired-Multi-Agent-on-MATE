@@ -4,8 +4,8 @@ Neither upstream repository ships tests or a test runner, so there is no
 convention to follow and no dependency to add: these use the standard library's
 ``unittest``.
 
-    python -m unittest discover -s tests -v
-    RESEARCH_SLOW_TESTS=1 python -m unittest discover -s tests -v   # + the full pipeline
+    python -m unittest tests.test_research -v
+    RESEARCH_SLOW_TESTS=1 python -m unittest tests.test_research -v   # + the full pipeline
 
 The slow test builds DIMA's 14M-parameter denoiser, so it is opt-in.
 """
@@ -349,6 +349,55 @@ class TestWorldModelInterface(unittest.TestCase):
                 oracle.predict(history, np.zeros((2, 3), dtype=np.int64), horizon=1)
             with self.assertRaises(ValueError):
                 oracle.predict(history, np.zeros((2, 5, 4), dtype=np.int64), horizon=2)
+        finally:
+            env.close()
+
+
+class TestHistoryAlignment(unittest.TestCase):
+    """The state/action alignment the whole world-model path depends on.
+
+    ``actions[-1]`` must be the action that produced ``states[-1]``; the action
+    paired with the *current* state is the candidate a planner is choosing.  An
+    off-by-one here is silent -- the model still returns plausible states, just
+    conditioned on the wrong action -- so it is pinned by a test.
+    """
+
+    def test_push_records_action_and_resulting_state_together(self):
+        env = make_env(max_episode_steps=20)
+        try:
+            history = History(length=3)
+            observation = env.reset(seed=0)
+            history.seed(observation, env.n_agents, env.n_actions // 2)
+
+            applied = []
+            for step in range(4):
+                action = np.full(env.n_agents, step + 1, dtype=np.int64)
+                observation, *_ = env.step(action)
+                history.push(observation, action)
+                applied.append(action)
+
+                np.testing.assert_array_equal(history.action_array()[-1], action)
+                np.testing.assert_allclose(history.state_array()[-1], observation.state)
+        finally:
+            env.close()
+
+    def test_conditioning_actions_excludes_the_candidate_slot(self):
+        env = make_env(max_episode_steps=20)
+        try:
+            history = History(length=3)
+            observation = env.reset(seed=0)
+            history.seed(observation, env.n_agents, env.n_actions // 2)
+            for step in range(4):
+                observation, *_ = env.step(np.full(env.n_agents, step + 1, dtype=np.int64))
+                history.push(observation, np.full(env.n_agents, step + 1, dtype=np.int64))
+
+            conditioning = history.conditioning_actions(3)
+            self.assertEqual(conditioning.shape, (2, env.n_agents))
+            # actions were 1,2,3,4; the window of length 3 conditions on the two
+            # that precede the candidate, i.e. 3 and 4.
+            np.testing.assert_array_equal(conditioning[:, 0], [3, 4])
+
+            self.assertEqual(history.conditioning_actions(1).shape[0], 0)
         finally:
             env.close()
 

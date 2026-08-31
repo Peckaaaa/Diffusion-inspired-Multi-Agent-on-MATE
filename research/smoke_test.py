@@ -290,11 +290,17 @@ class SmokeTest:
             world_model = self.state['world_model']
             episode = self.state['episode']
 
-            history = History(length=world_model.conditioning_steps)
-            for transition in episode.transitions[-world_model.conditioning_steps :]:
-                history.states.append(transition.state)
-                history.observations.append(transition.obs)
-                history.actions.append(transition.action)
+            # History alignment: actions[i] is the action that produced states[i],
+            # so the action stored alongside transition k is transitions[k-1].action.
+            steps = world_model.conditioning_steps
+            history = History(length=steps)
+            transitions = episode.transitions
+            for offset in range(len(transitions) - steps, len(transitions)):
+                history.states.append(transitions[offset].state)
+                history.observations.append(transitions[offset].obs)
+                history.actions.append(
+                    transitions[offset - 1].action if offset > 0 else transitions[offset].action
+                )
 
             candidates = np.tile(episode.transitions[-1].action, (3, 1))
             candidates[:, 0] = [0, env.n_actions // 2, env.n_actions - 1]

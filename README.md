@@ -88,8 +88,8 @@ python -m research.evaluate --baseline-matrix --episodes 20 \
     --checkpoint runs/wm-4v2/ckpt/model_final.pth --diagnostics
 
 # tests
-python -m unittest discover -s tests -v
-RESEARCH_SLOW_TESTS=1 python -m unittest discover -s tests   # + the full pipeline
+python -m unittest tests.test_research -v
+RESEARCH_SLOW_TESTS=1 python -m unittest tests.test_research   # + the full pipeline
 ```
 
 ---

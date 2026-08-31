@@ -62,6 +62,25 @@ class History:
     ``length`` is the world model's conditioning horizon (3 for DIMA, from
     ``DreamerConfig.inner_model.num_steps_conditioning``).
 
+    Alignment -- the one invariant everything else depends on
+    ---------------------------------------------------------
+    ::
+
+        states[-1]   is  s_t        the current state
+        actions[-1]  is  a_{t-1}    the action that produced s_t
+        the candidate passed to predict() is a_t
+
+    So ``actions`` lags ``states`` by one step, and the action slot paired with
+    the current state is deliberately empty -- it is what a planner is choosing.
+    :meth:`push` maintains this: it records ``(a_t, s_{t+1})`` together.
+
+    DIMA's denoiser conditions on ``[s_{t-2}, s_{t-1}, s_t]`` with
+    ``[a_{t-2}, a_{t-1}, a_t]`` (``denoiser.forward`` slices ``shared_obs`` and
+    ``act`` with the same indices), so :meth:`DIMAWorldModel.predict` builds its
+    action buffer as ``actions[-(sl-1):] + [candidate]``.  Getting this off by
+    one is silent: the model still returns plausible states, just conditioned on
+    the wrong action, and every action-sensitivity number collapses.
+
     ``states`` is PRIVILEGED: it holds ``MultiAgentTracking.state()`` rescaled.
     DIMA's denoiser is a *global state* model, so a closed-loop planner driven by
     it is reading privileged information at conditioning time.  This is recorded
@@ -104,11 +123,34 @@ class History:
         self.actions = deque([filler.copy() for _ in range(self.length)], maxlen=self.length)
 
     def push(self, observation: MATEObservation, action: np.ndarray) -> None:
-        """Record the action taken at time ``t`` and the observation at ``t+1``."""
+        """Record the action taken at time ``t`` and the observation at ``t+1``.
+
+        Both go in together, which is what keeps ``actions[-1]`` the action that
+        produced ``states[-1]`` (see the class docstring).
+        """
 
         self.actions.append(np.asarray(action, dtype=np.int64).ravel())
         self.observations.append(observation.obs)
         self.states.append(observation.state)
+
+    def conditioning_actions(self, steps: int) -> np.ndarray:
+        """The ``steps - 1`` past actions that precede the action being chosen.
+
+        Returns shape ``(steps - 1, num_agents)``.  A world model completes this
+        with the candidate action to get a full ``steps``-long action window
+        aligned with ``state_array()[-steps:]``.
+        """
+
+        if steps <= 1:
+            width = self.action_array().shape[-1] if self.actions else 0
+            return np.zeros((0, width), dtype=np.int64)
+        past = self.action_array()
+        if past.shape[0] < steps - 1:
+            raise ValueError(
+                f'History holds {past.shape[0]} actions but {steps - 1} are needed '
+                f'to condition a {steps}-step window.'
+            )
+        return past[-(steps - 1) :]
 
     @property
     def is_full(self) -> bool:
@@ -383,11 +425,16 @@ class DIMAWorldModel(WorldModel):
         sl = self.conditioning_steps
 
         past_states = history.state_array()[-sl:]  # (sl, state_dim)
-        past_actions = history.action_array()[-sl:]  # (sl, C)
         if past_states.shape[0] < sl:
             raise ValueError(
                 f'History holds {past_states.shape[0]} steps but the model conditions on {sl}.'
             )
+        # The last action slot belongs to the candidate, so only sl-1 past
+        # actions are taken; see History's alignment invariant.
+        conditioning_actions = history.conditioning_actions(sl)  # (sl-1, C)
+        past_actions = np.concatenate(
+            [conditioning_actions, np.zeros((1, self.num_agents), dtype=np.int64)], axis=0
+        )
 
         samples = self.num_samples
         total = batch * samples
