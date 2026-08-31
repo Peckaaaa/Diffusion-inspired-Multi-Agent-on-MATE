@@ -8,5 +8,6 @@ class Env(str, Enum):
     GRF = "football"
     MAMUJOCO = "mamujoco"
     SMACv2 = "SMACv2"
+    MATE = "mate"  # added by the DIMA x MATE research layer; see research/UPSTREAM_PATCHES.md
 
 RANDOM_SEED = 23

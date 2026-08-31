@@ -1,0 +1,38 @@
+diff --git a/DIMA/agent/learners/DreamerLearner.py b/DIMA/agent/learners/DreamerLearner.py
+index 2ced650..b8a41a6 100644
+--- a/DIMA/agent/learners/DreamerLearner.py
++++ b/DIMA/agent/learners/DreamerLearner.py
+@@ -814,7 +814,21 @@ class DreamerLearner:
+                 done=torch.FloatTensor(data['done'].copy()),                            # (Length, n_agents, 1)
+                 filled=torch.ones(data['done'].shape[0], dtype=torch.bool)
+             )
+-        
++
++        elif self.env_type == Env.MATE:
++            # added by the DIMA x MATE research layer; see research/UPSTREAM_PATCHES.md.
++            # MATE has no action mask, so MamujocoEpisode (no av_action field) is the
++            # matching episode type -- same seven fields, discrete one-hot actions.
++            episode = MamujocoEpisode(
++                observation=torch.FloatTensor(data['observation'].copy()),              # (Length, n_agents, obs_dim)
++                shared_obs=torch.FloatTensor(data['shared_obs'].copy()),                # (Length, n_agents, state_dim)
++                next_shared_obs=torch.FloatTensor(data['next_shared_obs'].copy()),      # (Length, n_agents, state_dim)
++                action=torch.FloatTensor(data['action'].copy()),                        # (Length, n_agents, act_dim)
++                reward=torch.FloatTensor(data['reward'].copy()),                        # (Length, n_agents, 1)
++                done=torch.FloatTensor(data['done'].copy()),                            # (Length, n_agents, 1)
++                filled=torch.ones(data['done'].shape[0], dtype=torch.bool)
++            )
++
+         else:
+             raise NotImplementedError
+ 
+diff --git a/DIMA/environments.py b/DIMA/environments.py
+index d933774..4883d2b 100644
+--- a/DIMA/environments.py
++++ b/DIMA/environments.py
+@@ -8,5 +8,6 @@ class Env(str, Enum):
+     GRF = "football"
+     MAMUJOCO = "mamujoco"
+     SMACv2 = "SMACv2"
++    MATE = "mate"  # added by the DIMA x MATE research layer; see research/UPSTREAM_PATCHES.md
+ 
+ RANDOM_SEED = 23
