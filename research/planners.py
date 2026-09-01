@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 import research  # noqa: F401 - installs sys.path + compat shims
 
@@ -60,8 +62,11 @@ __all__ = [
     'RandomPlanner',
     'MATERandomPlanner',
     'ReactiveGreedyPlanner',
+    'DIMAActorPlanner',
     'ModelBasedGreedyPlanner',
     'PLANNER_REGISTRY',
+    'NEEDS_ACTOR',
+    'planner_class',
     'build_planner',
 ]
 
@@ -251,6 +256,75 @@ class RandomPlanner(Planner):
         action = self._rng.integers(0, self._num_actions, size=context.num_cameras)
         self._diagnostics = {}
         return action.astype(np.int64)
+
+
+class DIMAActorPlanner(Planner):
+    """Acts with DIMA's own actor network -- the policy being trained.
+
+    Every other planner here is a fixed baseline; this one is the learner's
+    current policy, which is what makes online training online.  It holds a
+    reference to the live ``actor`` module, so as the learner updates it the
+    behaviour changes with no re-wiring.
+
+    Sampling from the stochastic policy *is* the exploration.  DIMA's
+    ``DreamerController.step`` (controllers/DreamerController.py:104) adds an
+    epsilon branch on top, but that branch samples from ``avail_actions``, which
+    MATE does not have -- every camera action is always legal -- so it would be
+    a uniform random action.  ``temperature`` covers the same ground continuously
+    and is what MATE needs.
+    """
+
+    USES_WORLD_MODEL = False
+
+    def __init__(
+        self,
+        env: MATEEnv,
+        actor,
+        *,
+        seed: int = 0,
+        temperature: float = 1.0,
+        deterministic: bool = False,
+        name: str = 'dima_actor',
+    ) -> None:
+        super().__init__(name)
+        if env.n_actions <= 0 or not env.discrete:
+            raise ValueError('DIMAActorPlanner needs a discretised MATE action space.')
+        self._actor = actor
+        self._num_actions = env.n_actions
+        self._temperature = float(temperature)
+        self._deterministic = bool(deterministic)
+        self._generator = torch.Generator().manual_seed(int(seed))
+
+    @property
+    def actor(self):
+        """The live actor module this planner acts with."""
+
+        return self._actor
+
+    @torch.no_grad()
+    def plan(self, observation, prediction, context) -> np.ndarray:
+        was_training = self._actor.training
+        self._actor.eval()
+        try:
+            device = next(self._actor.parameters()).device
+            # (1, n_cameras, obs_dim) -- the shape DreamerController hands the actor.
+            feats = torch.as_tensor(observation.obs, dtype=torch.float32, device=device).unsqueeze(0)
+            _, logits = self._actor(feats)
+            logits = logits.squeeze(0).float().cpu() / self._temperature
+
+            if self._deterministic:
+                action = logits.argmax(-1)
+            else:
+                probs = F.softmax(logits, dim=-1)
+                action = torch.multinomial(probs, num_samples=1, generator=self._generator).squeeze(-1)
+
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-6)).sum(-1)
+        finally:
+            self._actor.train(was_training)
+
+        self._diagnostics = {'policy_entropy': float(entropy.mean())}
+        return action.numpy().astype(np.int64)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,10 +622,34 @@ PLANNER_REGISTRY: Dict[str, Type[Planner]] = {
     'heuristic': HeuristicPlanner,
     'predictive_greedy': ModelBasedGreedyPlanner,
     'oracle': ModelBasedGreedyPlanner,
+    'dima_actor': DIMAActorPlanner,
 }
 
 #: Planners that must be handed a world model.
 NEEDS_WORLD_MODEL = frozenset({'predictive_greedy', 'oracle'})
+
+#: Planners that act with DIMA's policy network.  They take it from the world model
+#: because that is where a checkpoint's actor is already loaded, but they never
+#: *plan* with the model -- ``USES_WORLD_MODEL`` stays False so the episode runner
+#: skips prediction work.
+NEEDS_ACTOR = frozenset({'dima_actor'})
+
+
+def planner_class(spec: str) -> Type[Planner]:
+    """The class ``spec`` resolves to, without constructing it.
+
+    Callers need this to know what a planner *is* before they can decide what to
+    pass it -- search depth, for instance, only means something to a planner that
+    searches with the world model.
+    """
+
+    if spec in PLANNER_REGISTRY:
+        return PLANNER_REGISTRY[spec]
+
+    cls = load_entry(spec)
+    if not (isinstance(cls, type) and issubclass(cls, Planner)):
+        raise TypeError(f'Entry point {spec!r} does not name a research.planners.Planner.')
+    return cls
 
 
 def build_planner(
@@ -571,6 +669,13 @@ def build_planner(
     if spec in PLANNER_REGISTRY:
         cls = PLANNER_REGISTRY[spec]
         needs_wm = spec in NEEDS_WORLD_MODEL
+        if spec in NEEDS_ACTOR and 'actor' not in kwargs:
+            if world_model is None or not hasattr(world_model, 'actor'):
+                raise ValueError(
+                    f'Planner {spec!r} acts with the DIMA policy network; pass actor=..., or a world '
+                    f'model carrying one (--world-model dima --checkpoint ...).'
+                )
+            kwargs['actor'] = world_model.actor
     else:
         cls = load_entry(spec)
         if not (isinstance(cls, type) and issubclass(cls, Planner)):

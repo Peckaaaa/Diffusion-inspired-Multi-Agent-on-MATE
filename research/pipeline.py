@@ -57,7 +57,7 @@ import research  # noqa: F401 - installs sys.path + compat shims
 
 from research import collect as collect_module
 from research import evaluate as evaluate_module
-from research import train_wm
+from research import train_online, train_wm
 from research.collect import DEFAULT_MIX
 from research.logging_utils import dependency_versions, git_provenance, log
 
@@ -69,6 +69,11 @@ __all__ = ['PIPELINE_SCENARIO', 'PRESETS', 'STAGES', 'run_pipeline', 'main']
 PIPELINE_SCENARIO = 'MATE-4v8-9'
 
 STAGES = ('collect', 'train', 'evaluate')
+
+#: ``--online`` swaps the offline pair for one stage that collects and trains at
+#: the same time.  There is no ``collect`` stage: the online loop gathers its own
+#: warmup and validation episodes, so a dataset written up front would go unread.
+ONLINE_STAGES = ('train_online', 'evaluate')
 
 #: Preset sizes.  ``None`` means "leave DIMA's own default alone" -- that is what
 #: makes ``server`` a faithful run rather than a shortened one.
@@ -84,6 +89,11 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         denoiser_steps_first_epoch=4,
         remodel_steps=4,
         sensitivity_samples=2,
+        # DIMA's original batch sizes: the raised defaults would demand a bigger
+        # replay buffer than this preset ever collects.
+        state_decoder_batch_size=256,
+        denoiser_batch_size=64,
+        rew_end_batch_size=128,
         # Kept tiny on purpose: the matrix's `oracle` row forks the real MATE
         # environment once per camera per candidate action, so its cost is
         # episodes x steps x 4 x 25 environment steps and it dominates this stage.
@@ -101,6 +111,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         wm_epochs=40,
         denoiser_steps_first_epoch=40,
         remodel_steps=20,
+        state_decoder_batch_size=None,
+        denoiser_batch_size=None,
+        rew_end_batch_size=None,
         sensitivity_samples=4,
         eval_episodes=10,
         eval_max_episode_steps=150,
@@ -118,6 +131,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         wm_epochs=None,
         denoiser_steps_first_epoch=None,
         remodel_steps=None,
+        state_decoder_batch_size=None,
+        denoiser_batch_size=None,
+        rew_end_batch_size=None,
         sensitivity_samples=8,
         # 10 x 150 is the protocol the README's published baseline matrix used, so
         # a server run stays comparable to it.  It is also as much as the `oracle`
@@ -142,6 +158,9 @@ _OVERRIDE_FIELDS = (
     'wm_epochs',
     'denoiser_steps_first_epoch',
     'remodel_steps',
+    'state_decoder_batch_size',
+    'denoiser_batch_size',
+    'rew_end_batch_size',
     'sensitivity_samples',
     'eval_episodes',
     'eval_max_episode_steps',
@@ -246,6 +265,9 @@ def run_pipeline(
     dry_run: bool = False,
     resume: Optional[str] = None,
     save_buffer: bool = False,
+    online: bool = False,
+    max_episodes: Optional[int] = None,
+    temperature: float = 1.0,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if preset not in PRESETS:
@@ -257,6 +279,13 @@ def run_pipeline(
     size = dict(PRESETS[preset])
     size.setdefault('min_buffer_size', None)
     size.update({k: v for k, v in (overrides or {}).items() if v is not None})
+
+    if online:
+        # A caller who did not name stages gets the online set; one who did keeps
+        # their choice, with 'train' understood as its online counterpart.
+        stages = ONLINE_STAGES if tuple(stages) == tuple(STAGES) else [
+            'train_online' if name == 'train' else name for name in stages
+        ]
 
     # A timestamped default means every invocation gets its own directory, so a
     # re-run after a preemption starts from scratch instead of resuming.  Naming
@@ -273,7 +302,11 @@ def run_pipeline(
     # DreamerLearner.step will not train at all until the buffer holds this many
     # steps, so a preset small enough to fall under it must lower MIN_BUFFER_SIZE
     # rather than fail deep inside DIMA.
-    required_buffer = train_wm.minimum_buffer_steps(size['horizon'])
+    required_buffer = train_wm.minimum_buffer_steps(
+        size['horizon'],
+        state_decoder_batch_size=size['state_decoder_batch_size'],
+        rew_end_batch_size=size['rew_end_batch_size'],
+    )
     train_steps = (size['episodes'] - size['val_episodes']) * size['max_episode_steps']
     min_buffer_size = size['min_buffer_size']
     if min_buffer_size is None and train_steps < 5000:
@@ -294,7 +327,14 @@ def run_pipeline(
         f'horizon={size["horizon"]} | evaluate {size["eval_episodes"]} episodes '
         f'x{size["eval_max_episode_steps"]} steps',
     )
-    if train_steps < required_buffer:
+    if online and max_hours is None and max_episodes is None:
+        log(
+            'WARN',
+            'online training has no stop condition, so it runs until you stop it and the '
+            'evaluate stage never starts. Pass --max-hours or --max-episodes to bound it.',
+        )
+
+    if not online and train_steps < required_buffer:
         raise ValueError(
             f'{train_steps} training steps is below the {required_buffer} '
             f'DreamerLearner.step needs at horizon={size["horizon"]}. '
@@ -311,6 +351,7 @@ def run_pipeline(
         'discrete_levels': discrete_levels,
         'policy_mix': mix,
         'stages_requested': list(stages),
+        'mode': 'online' if online else 'offline',
         'sizes': size,
         'min_buffer_size': min_buffer_size,
         'device': device_info,
@@ -400,6 +441,44 @@ def run_pipeline(
         return int(meta.get('next_pass', 0)) >= int(meta.get('passes', 0))
 
     stage(
+        'train_online',
+        # Online training has no pass count to be finished against: it stops when
+        # the operator or the budget says so, and a re-run continues from the
+        # resumable checkpoint rather than being skipped.
+        False,
+        lambda: str(
+            train_online.train(
+                wm_dir,
+                scenario=scenario,
+                seed=seed,
+                device=device,
+                horizon=size['horizon'],
+                max_episode_steps=size['max_episode_steps'],
+                discrete_levels=discrete_levels,
+                warmup_mix=mix,
+                temperature=temperature,
+                min_buffer_size=min_buffer_size,
+                n_samples=size['n_samples'],
+                wm_epochs=size['wm_epochs'],
+                denoiser_steps_first_epoch=size['denoiser_steps_first_epoch'],
+                remodel_steps=size['remodel_steps'],
+                state_decoder_batch_size=size['state_decoder_batch_size'],
+                denoiser_batch_size=size['denoiser_batch_size'],
+                rew_end_batch_size=size['rew_end_batch_size'],
+                val_episodes=size['val_episodes'],
+                sensitivity_samples=size['sensitivity_samples'],
+                threads=threads,
+                max_hours=max_hours,
+                max_episodes=max_episodes,
+                wandb_mode=wandb_mode,
+                tensorboard=tensorboard,
+                resume=train_resume,
+                save_buffer=save_buffer,
+            )
+        ),
+    )
+
+    stage(
         'train',
         train_finished(),
         lambda: str(
@@ -417,6 +496,9 @@ def run_pipeline(
                 wm_epochs=size['wm_epochs'],
                 denoiser_steps_first_epoch=size['denoiser_steps_first_epoch'],
                 remodel_steps=size['remodel_steps'],
+                state_decoder_batch_size=size['state_decoder_batch_size'],
+                denoiser_batch_size=size['denoiser_batch_size'],
+                rew_end_batch_size=size['rew_end_batch_size'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -498,6 +580,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                              'automatically and takes precedence.')
     parser.add_argument('--save-buffer', action='store_true',
                         help='include the replay buffer in resumable checkpoints')
+    parser.add_argument('--online', action='store_true',
+                        help='collect with the policy being trained instead of replaying a '
+                             'fixed dataset; runs until --max-hours or --max-episodes')
+    parser.add_argument('--max-episodes', type=int, default=None,
+                        help='online only: stop after this many collected episodes')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='online only: softmax temperature of the acting policy')
     parser.add_argument('--dry-run', action='store_true', help='print the resolved plan and exit')
 
     sizes = parser.add_argument_group('preset overrides (each defaults to the preset value)')
@@ -511,6 +600,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     sizes.add_argument('--wm-epochs', type=int, default=None)
     sizes.add_argument('--denoiser-steps-first-epoch', type=int, default=None)
     sizes.add_argument('--remodel-steps', type=int, default=None)
+    sizes.add_argument('--state-decoder-batch-size', type=int, default=None)
+    sizes.add_argument('--denoiser-batch-size', type=int, default=None)
+    sizes.add_argument('--rew-end-batch-size', type=int, default=None)
     sizes.add_argument('--sensitivity-samples', type=int, default=None)
     sizes.add_argument('--eval-episodes', type=int, default=None)
     sizes.add_argument('--eval-max-episode-steps', type=int, default=None)
@@ -538,6 +630,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dry_run=args.dry_run,
         resume=args.resume,
         save_buffer=args.save_buffer,
+        online=args.online,
+        max_episodes=args.max_episodes,
+        temperature=args.temperature,
         overrides={field: getattr(args, field) for field in _OVERRIDE_FIELDS},
     )
     return 0

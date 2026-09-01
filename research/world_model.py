@@ -430,6 +430,16 @@ class DIMAWorldModel(WorldModel):
         target.var = np.asarray(rms.var, dtype=np.float64)
         target.count = float(rms.count)
 
+    @property
+    def actor(self):
+        """DIMA's policy network from this checkpoint.
+
+        Exposed so a planner can *act* with the policy that was trained alongside
+        the world model, rather than only planning with the model.
+        """
+
+        return self._learner.actor
+
     def _attach(self, learner, env: MATEEnv, config, *, num_samples: int, checkpoint_path) -> None:
         """Bind to a learner's modules. Shared by the load path and :meth:`from_learner`."""
 

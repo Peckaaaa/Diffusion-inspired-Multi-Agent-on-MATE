@@ -42,6 +42,7 @@ import research  # noqa: F401 - installs sys.path + compat shims
 from research.collect import load_dataset
 from research.config import (
     CHECKPOINT_CONFIG_FILENAME,
+    MATEDreamerLearnerConfig,
     allow_dima_checkpoint_globals,
     build_learner_config,
     configure_torch,
@@ -49,11 +50,13 @@ from research.config import (
 )
 from research.env_adapter import MATEEnv
 from research.logging_utils import (
-    WANDB_REF_PREFIX,
+    RESUME_CHECKPOINT_FILENAME,
+    RESUME_META_FILENAME,
     RunLogger,
-    download_checkpoint_artifact,
     log,
+    read_resume_meta,
     read_wandb_run_id,
+    resolve_resume,
 )
 from research.validation import ValidationEpisode, format_trend, validate
 from research.views import ObservationLayout
@@ -75,27 +78,36 @@ def build_env_from_manifest(manifest: Dict, *, seed: int = 0) -> MATEEnv:
     )
 
 
-def minimum_buffer_steps(horizon: int) -> int:
+def minimum_buffer_steps(
+    horizon: int,
+    *,
+    state_decoder_batch_size: Optional[int] = None,
+    rew_end_batch_size: Optional[int] = None,
+) -> int:
     """Smallest replay buffer ``DreamerLearner.step`` can actually train from.
 
     ``DreamerMemory.sample_indices`` raises a bare ``ValueError('Not enough data
     in buffer')`` when ``batch_size * sequence_length`` exceeds what the buffer
-    holds (DreamerMemory.py:223-227).  ``DreamerLearner.step`` draws two such
-    batches with hard-coded sizes:
+    holds (DreamerMemory.py:263).  ``DreamerLearner.step`` draws two such batches:
 
-    * state decoder -- ``bs=256``, ``sl=1``  (DreamerLearner.py:317)
-    * reward/end model -- ``bs=128``, ``sl=horizon`` for the transformer variant
-      (DreamerLearner.py:420)
+    * state decoder -- ``state_decoder_batch_size``, ``sl=1``
+    * reward/end model -- ``rew_end_batch_size``, ``sl=horizon`` for the
+      transformer variant
 
-    The second dominates: ``128 * horizon <= size - horizon + 1``.  Computing the
-    bound here turns a confusing crash deep inside DIMA into an up-front, named
+    The second usually dominates: ``bs * horizon <= size - horizon + 1``.  Computing
+    the bound here turns a confusing crash deep inside DIMA into an up-front, named
     constraint.
 
-    Takes the horizon rather than a config so ``research.pipeline`` can size a
-    preset before any DIMA config exists.
+    The batch sizes default to the config values rather than being hard-coded, so
+    raising them raises this bound with them.  Takes the horizon rather than a
+    config object so ``research.pipeline`` can size a preset before any DIMA
+    config exists.
     """
 
-    return max(256, 129 * int(horizon) - 1)
+    defaults = MATEDreamerLearnerConfig()
+    state_bs = int(state_decoder_batch_size or defaults.state_decoder_batch_size)
+    rew_end_bs = int(rew_end_batch_size or defaults.rew_end_batch_size)
+    return max(state_bs, (rew_end_bs + 1) * int(horizon) - 1)
 
 
 def check_dataset(manifest: Dict, rollouts, env: MATEEnv) -> None:
@@ -120,48 +132,6 @@ def check_dataset(manifest: Dict, rollouts, env: MATEEnv) -> None:
             )
 
 
-RESUME_CHECKPOINT_FILENAME = 'latest.pth'
-RESUME_META_FILENAME = 'resume_meta.json'
-
-
-def resolve_resume(resume: Optional[str], run_dir: Path) -> Optional[Path]:
-    """Locate the resumable checkpoint named by ``--resume``.
-
-    Accepts the checkpoint file, the run directory holding it, or a wandb
-    artifact reference ``wandb://entity/project/artifact:alias``. The wandb form
-    is the one that matters on a preemptible box: the run directory dies with the
-    instance, so wandb holds the only copy.
-    """
-
-    if resume is None:
-        return None
-
-    if str(resume).startswith(WANDB_REF_PREFIX):
-        ref = str(resume)[len(WANDB_REF_PREFIX):]
-        log('WM', f'downloading checkpoint artifact {ref} from wandb')
-        downloaded = download_checkpoint_artifact(ref, Path(run_dir) / 'resume')
-        path = downloaded / RESUME_CHECKPOINT_FILENAME
-    else:
-        path = Path(resume)
-        if path.is_dir():
-            path = path / 'ckpt' / RESUME_CHECKPOINT_FILENAME
-
-    if not path.is_file():
-        raise FileNotFoundError(f'No resumable checkpoint at {path}')
-
-    return path
-
-
-def read_resume_meta(checkpoint: Path) -> Dict[str, object]:
-    """Small sidecar travelling with the checkpoint, holding what has to be known
-    before the checkpoint itself is loaded -- currently the wandb run id."""
-
-    path = Path(checkpoint).parent / RESUME_META_FILENAME
-    if not path.is_file():
-        return {}
-    return json.loads(path.read_text(encoding='utf-8'))
-
-
 def train(
     dataset_dir: Path,
     run_dir: Path,
@@ -175,6 +145,9 @@ def train(
     wm_epochs: Optional[int] = None,
     denoiser_steps_first_epoch: Optional[int] = None,
     remodel_steps: Optional[int] = None,
+    state_decoder_batch_size: Optional[int] = None,
+    denoiser_batch_size: Optional[int] = None,
+    rew_end_batch_size: Optional[int] = None,
     train_actor_critic: bool = False,
     save_every: int = 1,
     val_episodes: int = 20,
@@ -210,6 +183,12 @@ def train(
     if remodel_steps is not None:
         overrides['remodel_steps'] = int(remodel_steps)
         overrides['remodel_steps_first_epoch'] = int(remodel_steps)
+    if state_decoder_batch_size is not None:
+        overrides['state_decoder_batch_size'] = int(state_decoder_batch_size)
+    if denoiser_batch_size is not None:
+        overrides['denoiser_batch_size'] = int(denoiser_batch_size)
+    if rew_end_batch_size is not None:
+        overrides['rew_end_batch_size'] = int(rew_end_batch_size)
 
     config = build_learner_config(
         env,
@@ -225,7 +204,11 @@ def train(
         config.DEVICE, detect_anomaly=detect_anomaly, threads=threads, seed=seed
     )
 
-    required = minimum_buffer_steps(config.horizon)
+    required = minimum_buffer_steps(
+        config.horizon,
+        state_decoder_batch_size=config.state_decoder_batch_size,
+        rew_end_batch_size=config.rew_end_batch_size,
+    )
     if config.MIN_BUFFER_SIZE < required:
         log(
             'WARN',
@@ -317,6 +300,11 @@ def train(
             'WM',
             f'MIN_BUFFER_SIZE={config.MIN_BUFFER_SIZE} N_SAMPLES={config.N_SAMPLES} '
             f'WM_EPOCHS={config.WM_EPOCHS} actor_critic={"on" if train_actor_critic else "off"}',
+        )
+        log(
+            'WM',
+            f'batch sizes: state_decoder={config.state_decoder_batch_size} '
+            f'denoiser={config.denoiser_batch_size} rew_end={config.rew_end_batch_size}',
         )
 
         rng = np.random.default_rng(seed)
@@ -537,6 +525,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--wm-epochs', type=int, default=None)
     parser.add_argument('--denoiser-steps-first-epoch', type=int, default=None)
     parser.add_argument('--remodel-steps', type=int, default=None)
+    parser.add_argument('--state-decoder-batch-size', type=int, default=None,
+                        help='DIMA used 256; the default here is larger. Pass the DIMA value '
+                             'together with the matching epoch counts to reproduce it.')
+    parser.add_argument('--denoiser-batch-size', type=int, default=None, help='DIMA used 64')
+    parser.add_argument('--rew-end-batch-size', type=int, default=None, help='DIMA used 128')
     parser.add_argument('--train-actor-critic', action='store_true')
     parser.add_argument('--save-every', type=int, default=1)
     parser.add_argument('--val-episodes', type=int, default=20,
@@ -573,6 +566,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wm_epochs=args.wm_epochs,
         denoiser_steps_first_epoch=args.denoiser_steps_first_epoch,
         remodel_steps=args.remodel_steps,
+        state_decoder_batch_size=args.state_decoder_batch_size,
+        denoiser_batch_size=args.denoiser_batch_size,
+        rew_end_batch_size=args.rew_end_batch_size,
         train_actor_critic=args.train_actor_critic,
         save_every=args.save_every,
         val_episodes=args.val_episodes,

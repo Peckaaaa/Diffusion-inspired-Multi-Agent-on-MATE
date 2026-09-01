@@ -24,7 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import research  # noqa: E402,F401 - installs sys.path + compat shims
 
 from research.env_adapter import MATEEnv, denormalize_observation  # noqa: E402
-from research.planners import PLANNER_REGISTRY, build_planner  # noqa: E402
+from research.planners import (  # noqa: E402
+    NEEDS_ACTOR,
+    PLANNER_REGISTRY,
+    DIMAActorPlanner,
+    build_planner,
+)
 from research.rollout import run_episode, to_dima_rollout  # noqa: E402
 from research.views import ObservationLayout, SceneView  # noqa: E402
 from research.world_model import AlphaOracleWorldModel, History, OracleWorldModel  # noqa: E402
@@ -178,7 +183,10 @@ class TestPlanners(unittest.TestCase):
         env = make_env(max_episode_steps=20)
         try:
             for spec, cls in PLANNER_REGISTRY.items():
-                if cls.USES_WORLD_MODEL:
+                # Skipped for opposite reasons: one plans with a world model, the
+                # other acts with a policy network. Neither is buildable from an
+                # environment alone, which is what this test covers.
+                if cls.USES_WORLD_MODEL or spec in NEEDS_ACTOR:
                     continue
                 planner = build_planner(spec, env, seed=0)
                 result = run_episode(env, planner, seed=0, max_steps=20)
@@ -188,6 +196,55 @@ class TestPlanners(unittest.TestCase):
                     self.assertTrue(
                         ((0 <= transition.action) & (transition.action < env.n_actions)).all(), spec
                     )
+        finally:
+            env.close()
+
+    def test_actor_planner_acts_with_the_policy_network(self):
+        """The learned policy has to be usable as a planner, or online training
+        cannot close its loop."""
+
+        from networks.dreamer.action import StochasticPolicy
+
+        from research.config import build_learner_config
+
+        env = make_env(max_episode_steps=20)
+        try:
+            config = build_learner_config(env, seed=0, device='cpu')
+            actor = StochasticPolicy(
+                config.IN_DIM,
+                config.ACTION_SIZE,
+                config.ACTION_HIDDEN,
+                config.ACTION_LAYERS,
+                continuous_action=config.CONTINUOUS_ACTION,
+                continuous_action_space=config.ACTION_SPACE,
+                policy_class=config.policy_class,
+            )
+            planner = DIMAActorPlanner(env, actor, seed=0)
+            result = run_episode(env, planner, seed=0, max_steps=20)
+
+            self.assertGreater(len(result), 0)
+            for transition in result.transitions:
+                self.assertEqual(transition.action.shape, (env.n_agents,))
+                self.assertTrue(((0 <= transition.action) & (transition.action < env.n_actions)).all())
+
+            # Whatever the actor produces has to be the same dict the learner is
+            # fed offline, or the two training paths diverge silently.
+            scripted = to_dima_rollout(
+                run_episode(env, build_planner('random', env, seed=0), seed=0, max_steps=20),
+                env.n_actions,
+            )
+            online = to_dima_rollout(result, env.n_actions)
+            self.assertEqual(set(online), set(scripted))
+            for key in scripted:
+                self.assertEqual(online[key].shape[1:], scripted[key].shape[1:], key)
+        finally:
+            env.close()
+
+    def test_actor_planner_without_an_actor_is_refused(self):
+        env = make_env(max_episode_steps=10)
+        try:
+            with self.assertRaises(ValueError):
+                build_planner('dima_actor', env, seed=0)
         finally:
             env.close()
 
@@ -281,6 +338,29 @@ class TestDIMAInterop(unittest.TestCase):
             self.assertEqual(config.rew_end_model_type, 'transformer')
         finally:
             env.close()
+
+
+class TestBufferSizing(unittest.TestCase):
+    """The batch sizes and the minimum buffer are one constraint, not two."""
+
+    def test_minimum_buffer_steps_follows_the_batch_sizes(self):
+        from research.train_wm import minimum_buffer_steps
+
+        # DIMA's own numbers, which this bound was originally written against.
+        self.assertEqual(
+            minimum_buffer_steps(5, state_decoder_batch_size=256, rew_end_batch_size=128), 644
+        )
+        # Raising a batch size raises the buffer it needs; a bound that ignored
+        # this is what makes DreamerMemory raise a bare 'Not enough data in buffer'
+        # deep inside training.
+        self.assertGreater(
+            minimum_buffer_steps(5, state_decoder_batch_size=1024, rew_end_batch_size=512),
+            minimum_buffer_steps(5, state_decoder_batch_size=256, rew_end_batch_size=128),
+        )
+        # The state decoder draws sl=1, so it dominates only at short horizons.
+        self.assertEqual(
+            minimum_buffer_steps(1, state_decoder_batch_size=1024, rew_end_batch_size=64), 1024
+        )
 
 
 class TestWorldModelInterface(unittest.TestCase):

@@ -12,10 +12,19 @@ class DreamerLearnerConfig(DreamerConfig):
         self.CAPACITY = 250000
         self.MIN_BUFFER_SIZE = 5000 # 500
         self.MODEL_EPOCHS = 200 # 60
-        self.WM_EPOCHS = 200  # 200
+        self.WM_EPOCHS = 50  # DIMA: 200, at a quarter of the batch size
         self.PPO_EPOCHS = 5
         self.MODEL_BATCH_SIZE = 30 # 40; 27m bs should be 10, agents_num ~ 10 should be 20
         self.BATCH_SIZE = 30 # 40; 27m bs should be 8, agents_num ~ 10 should be 20
+
+        # Batch sizes of the three world-model training loops.  DIMA hardcoded these
+        # (256 / 64 / 128); at those sizes a modern GPU sits mostly idle waiting on the
+        # single-threaded sampling path, so they are raised here and the matching epoch
+        # counts below are divided by the same factor -- same samples seen per round,
+        # a quarter of the optimizer steps and sampling calls.
+        self.state_decoder_batch_size = 1024
+        self.denoiser_batch_size = 256
+        self.rew_end_batch_size = 512
         # self.ac_batch_size = 600  # 600
         self.SEQ_LENGTH = self.horizon
         
@@ -49,7 +58,7 @@ class DreamerLearnerConfig(DreamerConfig):
         ### Denoiser learning params
         self.grad_acc_steps = 1
         self.denoiser_max_grad_norm = 1.0
-        self.denoiser_steps_first_epoch = 200  # 5000
+        self.denoiser_steps_first_epoch = 50  # DIMA: 200, at a quarter of the batch size
         self.denoiser_opt_cfg = {
             'lr': 0.0001,
             'weight_decay': 0.01,
@@ -58,8 +67,8 @@ class DreamerLearnerConfig(DreamerConfig):
         self.denoiser_lr_warmup_steps = 100
 
         ### rew_end_model learning params
-        self.remodel_steps_first_epoch = 60   # 5000
-        self.remodel_steps = 60
+        self.remodel_steps_first_epoch = 15   # DIMA: 60, at a quarter of the batch size
+        self.remodel_steps = 15
         self.rew_end_model_opt_cfg = {
             'lr': 0.0001,
             'weight_decay': 0.01,

@@ -37,6 +37,9 @@ CATEGORIES = (
     'DATA',
     'WM',
     'WM-DIAG',
+    'ONLINE',
+    'ONLINE-DIAG',
+    'CKPT',
     'PLANNER',
     'PLANNER-DIAG',
     'ACTION',
@@ -193,6 +196,48 @@ def download_checkpoint_artifact(ref: str, dest_dir: Path | str) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     artifact = wandb.Api().artifact(ref, type='world-model')
     return Path(artifact.download(root=str(dest_dir)))
+
+
+RESUME_CHECKPOINT_FILENAME = 'latest.pth'
+RESUME_META_FILENAME = 'resume_meta.json'
+
+
+def resolve_resume(resume: Optional[str], run_dir: Path) -> Optional[Path]:
+    """Locate the resumable checkpoint named by ``--resume``.
+
+    Accepts the checkpoint file, the run directory holding it, or a wandb
+    artifact reference ``wandb://entity/project/artifact:alias``. The wandb form
+    is the one that matters on a preemptible box: the run directory dies with the
+    instance, so wandb holds the only copy.
+    """
+
+    if resume is None:
+        return None
+
+    if str(resume).startswith(WANDB_REF_PREFIX):
+        ref = str(resume)[len(WANDB_REF_PREFIX):]
+        log('CKPT', f'downloading checkpoint artifact {ref} from wandb')
+        downloaded = download_checkpoint_artifact(ref, Path(run_dir) / 'resume')
+        path = downloaded / RESUME_CHECKPOINT_FILENAME
+    else:
+        path = Path(resume)
+        if path.is_dir():
+            path = path / 'ckpt' / RESUME_CHECKPOINT_FILENAME
+
+    if not path.is_file():
+        raise FileNotFoundError(f'No resumable checkpoint at {path}')
+
+    return path
+
+
+def read_resume_meta(checkpoint: Path) -> Dict[str, object]:
+    """Small sidecar travelling with the checkpoint, holding what has to be known
+    before the checkpoint itself is loaded -- currently the wandb run id."""
+
+    path = Path(checkpoint).parent / RESUME_META_FILENAME
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 class RunLogger:

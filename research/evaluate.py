@@ -35,7 +35,7 @@ from research.diagnostics import (
 from research.config import configure_torch, default_device
 from research.env_adapter import DEFAULT_SCENARIO, MATEEnv
 from research.logging_utils import RunLogger, log
-from research.planners import build_planner
+from research.planners import build_planner, planner_class
 from research.rollout import run_episode
 from research.views import ObservationLayout, SceneView
 from research.world_model import (
@@ -54,6 +54,7 @@ BASELINE_MATRIX = (
     ('mate_random', 'none'),
     ('reactive_greedy', 'none'),
     ('predictive_greedy', 'dima'),
+    ('dima_actor', 'dima'),
     ('oracle', 'oracle'),
 )
 
@@ -123,12 +124,17 @@ def evaluate(
         seed=seed,
         num_samples=num_samples,
     )
+    # ``horizon`` is a search depth, so it goes only to planners that actually
+    # search with the world model.  Some planners are handed a world model for
+    # another reason -- ``dima_actor`` takes its policy network from it -- and
+    # would reject the argument.
+    searches = planner_class(planner_spec).USES_WORLD_MODEL
     planner = build_planner(
         planner_spec,
         env,
         world_model=world_model,
         seed=seed,
-        **({'horizon': horizon} if world_model is not None else {}),
+        **({'horizon': horizon} if searches and world_model is not None else {}),
     )
 
     log('ENV', env.describe())

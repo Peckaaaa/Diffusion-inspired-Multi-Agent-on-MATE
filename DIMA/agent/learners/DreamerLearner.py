@@ -409,7 +409,7 @@ class DreamerLearner:
         pbar = tqdm(range(self.config.WM_EPOCHS if self.cur_wandb_epoch > 0 else 200),
                     desc=f"Training State Decoder", file=sys.stdout, disable=not self.tqdm_vis)
         for _ in pbar:
-            samples = self.mamba_replay_buffer.sample_batch(bs=256, sl=1 if self.config.state_decoder_type == StateDecoderType.OPTION1 else 2, mode="tokenizer")
+            samples = self.mamba_replay_buffer.sample_batch(bs=self.config.state_decoder_batch_size, sl=1 if self.config.state_decoder_type == StateDecoderType.OPTION1 else 2, mode="tokenizer")
             samples = self._to_device(samples)
 
             # normalize state
@@ -454,7 +454,7 @@ class DreamerLearner:
         to_log = []
         for i in pbar:
             ## FINISH: already added temperature sampling batch
-            samples = self.replay_buffer.sample_batch(batch_num_samples=64,
+            samples = self.replay_buffer.sample_batch(batch_num_samples=self.config.denoiser_batch_size,
                                                       sequence_length=self.config.denoiser_cfg.inner_model.num_steps_conditioning + 1 + 2,
                                                       sample_from_start=False,
                                                       valid_sample=False)
@@ -512,7 +512,7 @@ class DreamerLearner:
                     desc=f"Training Function", file=sys.stdout, disable=not self.tqdm_vis)
         to_log = []
         for i in pbar:
-            samples = self.mamba_replay_buffer.sample_batch(bs=128, sl=self.config.horizon if self.rew_end_model.__class__ == TransRewEndModel else 20, mode='rew_end_model')
+            samples = self.mamba_replay_buffer.sample_batch(bs=self.config.rew_end_batch_size, sl=self.config.horizon if self.rew_end_model.__class__ == TransRewEndModel else 20, mode='rew_end_model')
             samples = self._to_device(samples)
 
             samples['shared_obs'] = self.normalize_state(samples['shared_obs'].mean(2))
