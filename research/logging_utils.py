@@ -194,6 +194,7 @@ class RunLogger:
         self.name = name
         self._started = time.time()
         self._files: Dict[str, Any] = {}
+        self._wandb_mode = wandb_mode
 
         import wandb
 
@@ -282,6 +283,29 @@ class RunLogger:
         if original is not None:
             self._tb.log_scalar = original
             self._tb._research_tee = None
+
+    def log_checkpoint(self, *paths: Path | str, aliases: Iterable[str] = ()) -> None:
+        """Push a checkpoint to wandb as one version of this run's model artifact.
+
+        A rented GPU box is not durable storage: the run directory disappears with
+        the instance, so the checkpoints have to leave the machine while the run is
+        still going. Every call adds a new version of the single artifact
+        ``<run name>-ckpt``, which is why the config sidecar is passed alongside the
+        weights -- a checkpoint is only loadable at the horizon and dims recorded
+        there, so the two travel together or neither is useful.
+
+        Uploading is skipped entirely when wandb is disabled. ``'offline'`` records
+        the versions locally for a later ``wandb sync``.
+        """
+
+        if self._wandb_mode == 'disabled':
+            return
+        artifact = self._wandb.Artifact(f'{self.name}-ckpt', type='world-model')
+        for path in paths:
+            path = Path(path)
+            if path.is_file():
+                artifact.add_file(str(path), name=path.name)
+        self._wandb.log_artifact(artifact, aliases=list(aliases))
 
     def records(self, stream: str, rows: Iterable[Mapping[str, Any]]) -> None:
         """Append structured rows to ``<run_dir>/<stream>.jsonl``.

@@ -207,6 +207,41 @@ command after a preemption continues rather than starting over (`--force`
 re-runs, `--stages collect,train` runs a subset). `--dry-run` prints the resolved
 plan and exits.
 
+### Getting the checkpoints off a rented box
+
+`train_wm.py` already saves `ckpt/model_pass{NNN}.pth` after every pass and
+`ckpt/model_final.pth` at the end, with `ckpt/config.json` written before the
+first save. On a rented instance that is not enough on its own: the run directory
+dies with the instance, and the pipeline resumes at *stage* granularity — the
+train stage is skipped only once `model_final.pth` exists, so a job killed mid-way
+restarts from pass 0.
+
+So when wandb is on, every checkpoint is also pushed there as a new version of the
+artifact `wm-<scenario>-s<seed>-ckpt`, aliased `pass001`, `pass002`, … and
+`final`. The config sidecar goes in the same version, because a checkpoint is only
+loadable at the horizon and dims recorded in it. `RunLogger.log_checkpoint` does
+nothing when `--wandb-mode disabled` (the default); `offline` stages the versions
+locally for a later `wandb sync`.
+
+Authenticate with the environment variable — never a file in the repository, and
+never on the command line, where it lands in the shell history:
+
+```bash
+export WANDB_API_KEY=...          # or: wandb login
+export WANDB_ENTITY=<your-entity> # optional; defaults to the key's owner
+python -m research.pipeline --preset server --wandb-mode online ...
+```
+
+Pull a checkpoint back down from anywhere:
+
+```bash
+python -c "import wandb; print(wandb.Api().artifact('<entity>/dima-mate/wm-MATE-4v8-9-s0-ckpt:final').download())"
+```
+
+One version is roughly 90 MB (23 M parameters, fp32, plus optimiser state), so
+20 passes is about 1.8 GB per seed. Raise `--save-every` on `train_wm.py` to
+upload less often; the pipeline saves and uploads every pass.
+
 | preset | sizes |
 |---|---|
 | `smoke` | 12 × 100 steps, 1 pass, 1 × 25-step evaluation — proves the three stages wire together |
@@ -468,7 +503,7 @@ of `size mismatch` lines that never mentions horizons.
 | `research/planners.py` | `Planner` interface, MATE-agent baselines, model-based planner, registry |
 | `research/rollout.py` | the closed loop; conversion to DIMA's rollout dict |
 | `research/diagnostics.py` | prediction error, action sensitivity, ranking, planner metrics |
-| `research/logging_utils.py` | `[CATEGORY]` console + wandb + DIMA's TensorBoard + run manifest |
+| `research/logging_utils.py` | `[CATEGORY]` console + wandb (scalars + checkpoint artifacts) + DIMA's TensorBoard + run manifest |
 | `research/pipeline.py` | collect → train → evaluate in one command; presets, run layout, resume |
 | `research/collect.py` `train_wm.py` `evaluate.py` `smoke_test.py` `mate_evaluate.py` | entry points |
 | `tests/test_research.py` | `unittest`; neither upstream ships tests |

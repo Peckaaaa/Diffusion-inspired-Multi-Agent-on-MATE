@@ -373,12 +373,14 @@ def train(
                 path = Path(run_dir) / 'ckpt' / f'model_pass{pass_index + 1:03d}.pth'
                 learner.save(str(path))
                 log('WM', f'checkpoint -> {path}')
+                logger.log_checkpoint(path, sidecar, aliases=[f'pass{pass_index + 1:03d}'])
 
             if stopped_early:
                 break
 
         learner.save(str(checkpoint))
         log('WM', f'final checkpoint -> {checkpoint}')
+        logger.log_checkpoint(checkpoint, sidecar, aliases=['final'])
         logger.update_manifest(
             checkpoint=str(checkpoint),
             fed_steps=fed_steps,
