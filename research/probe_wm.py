@@ -46,6 +46,7 @@ import research  # noqa: F401 - installs sys.path + compat shims
 
 from mate import constants as consts
 from research.collect import load_dataset
+from research.config import allow_dima_checkpoint_globals
 from research.logging_utils import log
 from research.train_wm import build_env_from_manifest
 from research.validation import ValidationEpisode, _history_at
@@ -59,6 +60,48 @@ __all__ = ['probe', 'main']
 #: Thresholds the mask is scored at.  ``SceneView`` uses 0.5; the rest are here to
 #: show whether that particular cut is what produces zero recall.
 MASK_THRESHOLDS = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def _weights_checkpoint(checkpoint: Path) -> Path:
+    """A checkpoint in the weights-only shape ``DIMAWorldModel`` can load.
+
+    ``ckpt/latest.pth`` is the resumable checkpoint written by
+    ``DreamerLearner.save_full``: optimiser state, counters and RNG state wrapped
+    around the weights. It is the freshest state a running job has on disk and so
+    the natural thing to probe, but ``load_pretrained`` expects the flat
+    ``params()`` layout. Rather than make the caller hunt for the newest
+    ``model_ep*.pth``, the weights are extracted into a sibling file here.
+
+    A checkpoint already in the flat shape is returned unchanged.
+    """
+
+    import torch
+
+    checkpoint = Path(checkpoint)
+    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict) or 'learner' not in ckpt:
+        return checkpoint
+
+    state = ckpt['learner']
+    modules = state['modules']
+    rms_fields = state['state_rms']
+
+    from agent.utils.running_mean_std import RunningMeanStd
+
+    running_mean_std = RunningMeanStd(shape=np.asarray(rms_fields['mean']).shape)
+    running_mean_std.mean = np.asarray(rms_fields['mean'], dtype=np.float64)
+    running_mean_std.var = np.asarray(rms_fields['var'], dtype=np.float64)
+    running_mean_std.count = float(rms_fields['count'])
+
+    flat = {name: modules[name] for name in
+            ('state_decoder', 'denoiser', 'rew_end_model', 'actor', 'critic')
+            if name in modules}
+    flat['running_mean_std'] = running_mean_std
+
+    extracted = checkpoint.with_name(checkpoint.stem + '_weights.pth')
+    torch.save(flat, extracted)
+    log('PROBE', f'extracted weights from the resumable checkpoint -> {extracted}')
+    return extracted
 
 
 def _summarise(name: str, error: np.ndarray, truth: np.ndarray) -> Dict[str, float]:
@@ -96,7 +139,12 @@ def probe(
     env = build_env_from_manifest(manifest, seed=seed)
     layout = ObservationLayout.from_env_metadata(env.metadata())
 
-    model = DIMAWorldModel(env, checkpoint, device=device, num_samples=num_samples)
+    # DreamerLearner.load_pretrained calls torch.load with PyTorch's 2.6 default
+    # of weights_only=True; DIMA checkpoints carry a live RunningMeanStd.
+    allow_dima_checkpoint_globals()
+    model = DIMAWorldModel(
+        env, _weights_checkpoint(checkpoint), device=device, num_samples=num_samples
+    )
     conditioning = model.conditioning_steps
 
     episodes = [ValidationEpisode.from_rollout(r, env) for r in rollouts]
@@ -320,7 +368,9 @@ def _print_report(report: Dict[str, object]) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog='python -m research.probe_wm', description=__doc__)
-    parser.add_argument('--checkpoint', required=True, type=Path)
+    parser.add_argument('--checkpoint', required=True, type=Path,
+                        help='a weights checkpoint (model_*.pth) or a resumable one '
+                             '(ckpt/latest.pth); the latter has its weights extracted')
     parser.add_argument('--dataset', required=True, type=Path,
                         help='held-out episodes to probe on; any collected dataset works')
     parser.add_argument('--transitions', type=int, default=300)
