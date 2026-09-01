@@ -124,6 +124,75 @@ def _summarise(name: str, error: np.ndarray, truth: np.ndarray) -> Dict[str, flo
     }
 
 
+def _decoder_reconstruction(model, episodes, layout, rng, count: int) -> Dict[str, object]:
+    """What the state decoder alone produces from the *true* next state.
+
+    An observation never comes out of the denoiser directly. The denoiser predicts
+    the next global state, and ``state_decoder.encode_decode`` turns that state
+    into the joint observation (``world_model.py:610``). Two very different
+    failures therefore look identical in the headline metrics:
+
+    * the denoiser predicts the wrong state, or
+    * the decoder cannot express the sighting mask no matter which state it gets.
+
+    Feeding the ground-truth next state through the decoder separates them. If the
+    mask is still flat here, the diffusion model is not the thing to fix -- the
+    state has to be decodable before predicting it can help.
+    """
+
+    import torch
+
+    states: List[np.ndarray] = []
+    truths: List[np.ndarray] = []
+    while len(states) < count:
+        episode = episodes[int(rng.integers(len(episodes)))]
+        last = len(episode.transitions) - 1
+        if last <= 1:
+            continue
+        t = int(rng.integers(0, last))
+        # transitions[t].next_obs_raw is the successor of transitions[t], whose
+        # state is transitions[t + 1].state.
+        states.append(episode.transitions[t + 1].state)
+        truths.append(episode.transitions[t].next_obs_raw)
+
+    state_batch = torch.as_tensor(np.stack(states), dtype=torch.float32, device=model.device)
+    with torch.no_grad():
+        normalised = model._normalize_state(state_batch.unsqueeze(1)).squeeze(1)
+        flat = model.state_decoder.encode_decode(normalised)
+    decoded = flat.reshape(len(states), model.num_agents, model.obs_dim).cpu().numpy()
+    decoded_world = model._unrescale_obs(decoded.astype(np.float64))
+    truth_world = np.stack(truths)
+
+    entry_dim = consts.TARGET_STATE_DIM_PUBLIC + 1
+    opp = layout.slices['opponent_states_with_mask']
+    dec_mask = decoded_world[:, :, opp].reshape(
+        -1, layout.num_cameras, layout.num_targets, entry_dim
+    )[..., consts.TARGET_STATE_DIM_PUBLIC]
+    true_mask = truth_world[:, :, opp].reshape(
+        -1, layout.num_cameras, layout.num_targets, entry_dim
+    )[..., consts.TARGET_STATE_DIM_PUBLIC]
+    sighted = true_mask > 0.5
+
+    self_state = layout.slices['self_state']
+    camera_err = decoded_world[:, :, self_state][..., 0:2] - truth_world[:, :, self_state][..., 0:2]
+
+    return {
+        'count': len(states),
+        'mask_pred_min': float(dec_mask.min()),
+        'mask_pred_max': float(dec_mask.max()),
+        'mask_mean_where_sighted': float(dec_mask[sighted].mean()) if sighted.any() else None,
+        'mask_mean_where_unsighted': (
+            float(dec_mask[~sighted].mean()) if (~sighted).any() else None
+        ),
+        'recall_at_threshold': {
+            str(th): (float((dec_mask[sighted] > th).mean()) if sighted.any() else None)
+            for th in MASK_THRESHOLDS
+        },
+        'camera_pos_mae': float(np.abs(camera_err).mean()),
+        'camera_pos_truth_std': float(truth_world[:, :, self_state][..., 0:2].std()),
+    }
+
+
 def probe(
     checkpoint: Path,
     dataset_dir: Path,
@@ -284,6 +353,11 @@ def probe(
             recalls.append(float(agreed.sum()) / float(true_view.target_sighted.sum()))
     report['sceneview_sighting_recall'] = float(np.mean(recalls)) if recalls else None
 
+    # Decoder in isolation: the same question asked of the true next state.
+    report['decoder_reconstruction'] = _decoder_reconstruction(
+        model, episodes, layout, np.random.default_rng(seed + 1), min(transitions, 200)
+    )
+
     env.close()
     return report
 
@@ -348,6 +422,29 @@ def _print_report(report: Dict[str, object]) -> None:
     log('PROBE', f'SceneView sighting recall (what validate reports): '
                  f'{"N/A" if recall is None else f"{recall:.4f}"}')
 
+    dec = report['decoder_reconstruction']
+    log('PROBE', '--- state decoder alone, fed the TRUE next state ---')
+    log(
+        'PROBE',
+        f'  decoded mask range      [{dec["mask_pred_min"]:.4f}, {dec["mask_pred_max"]:.4f}]',
+    )
+    if dec['mask_mean_where_sighted'] is not None:
+        log(
+            'PROBE',
+            f'  mean where sighted      {dec["mask_mean_where_sighted"]:.4f} vs unsighted '
+            f'{dec["mask_mean_where_unsighted"]:.4f} '
+            f'(separation {dec["mask_mean_where_sighted"] - dec["mask_mean_where_unsighted"]:+.4f})',
+        )
+    for th in MASK_THRESHOLDS:
+        recall = dec['recall_at_threshold'][str(th)]
+        if recall is not None:
+            log('PROBE', f'  threshold {th:<5} recall={recall:.4f}')
+    log(
+        'PROBE',
+        f'  camera pos mae          {dec["camera_pos_mae"]:.4f} '
+        f'(truth std {dec["camera_pos_truth_std"]:.4f})',
+    )
+
     log('PROBE', '--- reading this ---')
     log(
         'PROBE',
@@ -363,6 +460,16 @@ def _print_report(report: Dict[str, object]) -> None:
         'PROBE',
         '  camera mae << truth_std but mask separation ~0 -> the model learned the '
         'easy block only; more training or a different sighting loss',
+    )
+    log(
+        'PROBE',
+        '  decoder mask flat on the TRUE state            -> the decoder is the '
+        'bottleneck, not the denoiser: predicting states better cannot help',
+    )
+    log(
+        'PROBE',
+        '  decoder mask separated but prediction flat     -> the decoder works, the '
+        'denoiser is not predicting usable states yet',
     )
 
 
