@@ -39,6 +39,7 @@ CATEGORIES = (
     'WM-DIAG',
     'ONLINE',
     'ONLINE-DIAG',
+    'PROBE',
     'CKPT',
     'PLANNER',
     'PLANNER-DIAG',
