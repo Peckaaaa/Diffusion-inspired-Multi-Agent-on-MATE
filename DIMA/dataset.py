@@ -252,6 +252,43 @@ class MultiAgentEpisodesDataset(EpisodesDatasetRamMonitoring):
         self.next_idx = 0
         self.full = False
 
+    def state_dict(self):
+        """Full replay contents plus segment bookkeeping, for resuming a run.
+
+        Episodes hold the raw rollouts, so this can be large; callers decide
+        whether a run is worth the disk.
+        """
+        return {
+            'episodes': list(self.episodes),
+            'visit_entries': list(self.visit_entries),
+            'episode_lens': list(self.episode_lens),
+            'episode_id_to_queue_idx': dict(self.episode_id_to_queue_idx),
+            'num_seen_episodes': self.num_seen_episodes,
+            'num_steps': self.num_steps,
+            'max_num_steps': self.max_num_steps,
+            'min_episode_length': self.min_episode_length,
+            'segment_ids': self.segment_ids.clone(),
+            'visit_counts': self.visit_counts.clone(),
+            'next_idx': self.next_idx,
+            'full': self.full,
+        }
+
+    def load_state_dict(self, state):
+        self.episodes = deque(state['episodes'])
+        self.visit_entries = deque(state['visit_entries'])
+        self.episode_lens = deque(state['episode_lens'])
+        self.episode_id_to_queue_idx = dict(state['episode_id_to_queue_idx'])
+        self.num_seen_episodes = state['num_seen_episodes']
+        self.num_steps = state['num_steps']
+        self.max_num_steps = state['max_num_steps']
+        self.min_episode_length = state['min_episode_length']
+        self.segment_ids = state['segment_ids'].clone()
+        self.visit_counts = state['visit_counts'].clone()
+        self.next_idx = state['next_idx']
+        self.full = state['full']
+        # Everything restored is already on disk in the checkpoint.
+        self.newly_modified_episodes, self.newly_deleted_episodes = set(), set()
+
     def add_episode(self, episode):
         if self.max_num_steps is None and self.check_ram_usage():
             self.max_num_steps = self.num_steps

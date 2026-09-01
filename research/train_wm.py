@@ -29,6 +29,7 @@ actor with a planner.  It is disabled through configuration
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -47,7 +48,13 @@ from research.config import (
     export_checkpoint_config,
 )
 from research.env_adapter import MATEEnv
-from research.logging_utils import RunLogger, log
+from research.logging_utils import (
+    WANDB_REF_PREFIX,
+    RunLogger,
+    download_checkpoint_artifact,
+    log,
+    read_wandb_run_id,
+)
 from research.validation import ValidationEpisode, format_trend, validate
 from research.views import ObservationLayout
 
@@ -113,6 +120,48 @@ def check_dataset(manifest: Dict, rollouts, env: MATEEnv) -> None:
             )
 
 
+RESUME_CHECKPOINT_FILENAME = 'latest.pth'
+RESUME_META_FILENAME = 'resume_meta.json'
+
+
+def resolve_resume(resume: Optional[str], run_dir: Path) -> Optional[Path]:
+    """Locate the resumable checkpoint named by ``--resume``.
+
+    Accepts the checkpoint file, the run directory holding it, or a wandb
+    artifact reference ``wandb://entity/project/artifact:alias``. The wandb form
+    is the one that matters on a preemptible box: the run directory dies with the
+    instance, so wandb holds the only copy.
+    """
+
+    if resume is None:
+        return None
+
+    if str(resume).startswith(WANDB_REF_PREFIX):
+        ref = str(resume)[len(WANDB_REF_PREFIX):]
+        log('WM', f'downloading checkpoint artifact {ref} from wandb')
+        downloaded = download_checkpoint_artifact(ref, Path(run_dir) / 'resume')
+        path = downloaded / RESUME_CHECKPOINT_FILENAME
+    else:
+        path = Path(resume)
+        if path.is_dir():
+            path = path / 'ckpt' / RESUME_CHECKPOINT_FILENAME
+
+    if not path.is_file():
+        raise FileNotFoundError(f'No resumable checkpoint at {path}')
+
+    return path
+
+
+def read_resume_meta(checkpoint: Path) -> Dict[str, object]:
+    """Small sidecar travelling with the checkpoint, holding what has to be known
+    before the checkpoint itself is loaded -- currently the wandb run id."""
+
+    path = Path(checkpoint).parent / RESUME_META_FILENAME
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
 def train(
     dataset_dir: Path,
     run_dir: Path,
@@ -136,6 +185,8 @@ def train(
     max_hours: Optional[float] = None,
     wandb_mode: str = 'disabled',
     tensorboard: bool = False,
+    resume: Optional[str] = None,
+    save_buffer: bool = False,
 ) -> Path:
     manifest, rollouts = load_dataset(dataset_dir)
     env = build_env_from_manifest(manifest, seed=seed)
@@ -214,6 +265,14 @@ def train(
             'Use it only to chase a NaN.',
         )
 
+    resume_checkpoint = resolve_resume(resume, run_dir)
+    if resume_checkpoint is not None:
+        # A wandb-sourced checkpoint carries its run id in the sidecar beside it,
+        # so even a run whose directory is gone continues on its own curves.
+        resume_run_id = read_resume_meta(resume_checkpoint).get('wandb_run_id')
+    else:
+        resume_run_id = read_wandb_run_id(run_dir)
+
     with RunLogger(
         run_dir,
         name=f'wm-{manifest["scenario"]}-s{seed}',
@@ -221,6 +280,7 @@ def train(
         wandb_mode=wandb_mode,
         tensorboard=tensorboard,
         group=f'wm-{manifest["scenario"]}',
+        resume_run_id=resume_run_id if resume_checkpoint is not None else None,
     ) as logger:
         logger.update_manifest(
             phase='world_model_training',
@@ -261,6 +321,8 @@ def train(
 
         rng = np.random.default_rng(seed)
         checkpoint = Path(run_dir) / 'ckpt' / 'model_final.pth'
+        resume_path = Path(run_dir) / 'ckpt' / RESUME_CHECKPOINT_FILENAME
+        resume_meta_path = Path(run_dir) / 'ckpt' / RESUME_META_FILENAME
         # Written once, up front, so every checkpoint in this directory -- including
         # the intermediate ones -- is self-describing even if the run is killed.
         sidecar = export_checkpoint_config(
@@ -269,12 +331,38 @@ def train(
         log('WM', f'checkpoint config -> {sidecar}')
         started = time.time()
         fed_steps = 0
+        first_pass = 0
+        elapsed_before_resume = 0.0
+        validation_history_resumed: List[Dict[str, object]] = []
+
+        if resume_checkpoint is not None:
+            loop_state = learner.load_full(str(resume_checkpoint))
+            if loop_state is not None:
+                first_pass = int(loop_state['next_pass'])
+                fed_steps = int(loop_state['fed_steps'])
+                elapsed_before_resume = float(loop_state['elapsed_seconds'])
+                validation_history_resumed = list(loop_state['validation_history'])
+                rng.bit_generator.state = loop_state['rng_state']
+                log(
+                    'WM',
+                    f'resumed from {resume_checkpoint}: starting at pass {first_pass + 1}/{passes}, '
+                    f'fed_steps={fed_steps}, train_count={learner.train_count}, '
+                    f'buffer={learner.replay_buffer.num_steps} steps',
+                )
+                if learner.replay_buffer.num_steps < config.MIN_BUFFER_SIZE:
+                    log(
+                        'WARN',
+                        'the checkpoint carries no replay buffer, so training pauses until the '
+                        'buffer refills from the dataset. Pass --save-buffer to avoid this.',
+                    )
+            if first_pass >= passes:
+                log('WARN', f'checkpoint is already past --passes {passes}; nothing left to run.')
 
         layout = ObservationLayout.from_env_metadata(env.metadata())
         validation_set = [
             ValidationEpisode.from_rollout(r, env) for r in validation_rollouts
         ]
-        validation_history: List[Dict[str, object]] = []
+        validation_history: List[Dict[str, object]] = list(validation_history_resumed)
         world_model = None
 
         def run_validation(tag: int) -> None:
@@ -325,10 +413,37 @@ def train(
                     f'planner can use this model yet.',
                 )
 
-        deadline = started + max_hours * 3600.0 if max_hours else None
+        # The budget covers the run as a whole, not each restart of it.
+        deadline = started + max_hours * 3600.0 - elapsed_before_resume if max_hours else None
         stopped_early = False
 
-        for pass_index in range(passes):
+        def save_resumable(next_pass: int) -> None:
+            """Write the checkpoint a restart continues from, and push it to wandb.
+
+            The wandb copy is what survives the instance, so the sidecar naming the
+            run travels in the same artifact version as the weights.
+            """
+
+            learner.save_full(
+                resume_path,
+                runner_state={
+                    'next_pass': next_pass,
+                    'fed_steps': fed_steps,
+                    'elapsed_seconds': elapsed_before_resume + time.time() - started,
+                    'validation_history': validation_history,
+                    'rng_state': rng.bit_generator.state,
+                },
+                save_buffer=save_buffer,
+            )
+            resume_meta_path.write_text(
+                json.dumps({'wandb_run_id': getattr(logger.wandb_run, 'id', None),
+                            'next_pass': next_pass,
+                            'passes': passes}),
+                encoding='utf-8',
+            )
+            logger.log_checkpoint(resume_path, resume_meta_path, sidecar, aliases=['latest'])
+
+        for pass_index in range(first_pass, passes):
             order = rng.permutation(len(rollouts))
             for position, episode_index in enumerate(order):
                 if deadline is not None and time.time() > deadline:
@@ -369,11 +484,15 @@ def train(
             if eval_every and (pass_index + 1) % eval_every == 0:
                 run_validation(pass_index + 1)
 
+            # A pass cut short by --max-hours still counts as done: every pass is a
+            # fresh permutation of the same dataset, so resuming into the next one
+            # loses no data the run had not already replayed.
             if save_every and (pass_index + 1) % save_every == 0:
                 path = Path(run_dir) / 'ckpt' / f'model_pass{pass_index + 1:03d}.pth'
                 learner.save(str(path))
                 log('WM', f'checkpoint -> {path}')
                 logger.log_checkpoint(path, sidecar, aliases=[f'pass{pass_index + 1:03d}'])
+                save_resumable(pass_index + 1)
 
             if stopped_early:
                 break
@@ -431,6 +550,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help='stop cleanly and save before this wall-clock budget runs out')
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
+    parser.add_argument('--resume', default=None,
+                        help='continue from ckpt/latest.pth: pass the file, its run directory, '
+                             'or wandb://entity/project/artifact:alias')
+    parser.add_argument('--save-buffer', action='store_true',
+                        help='include the replay buffer in the resumable checkpoint, so a resumed '
+                             'run trains immediately instead of refilling (much larger uploads)')
     return parser.parse_args(argv)
 
 
@@ -454,6 +579,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         eval_every=args.eval_every,
         sensitivity_samples=args.sensitivity_samples,
         detect_anomaly=args.detect_anomaly,
+        resume=args.resume,
+        save_buffer=args.save_buffer,
         threads=args.threads,
         max_hours=args.max_hours,
         wandb_mode=args.wandb_mode,

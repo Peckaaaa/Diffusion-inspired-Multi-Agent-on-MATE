@@ -49,6 +49,42 @@ class DreamerMemory:
         self.n_agents = n_agents
         self.full = False
 
+    _STATE_ARRAYS = ('observations', 'shared_obs', 'next_shared_obs', 'actions',
+                     'av_actions', 'rewards', 'dones', 'fake', 'last')
+
+    def state_dict(self):
+        """Full buffer contents, for resuming an interrupted run."""
+        arrays = {}
+        for name in self._STATE_ARRAYS:
+            arr = getattr(self, name)
+            # Only the filled prefix is meaningful; the rest is uninitialised memory.
+            arrays[name] = None if arr is None else arr[:self.size].copy()
+        return {
+            'arrays': arrays,
+            'sample_visits': {k: v.clone() for k, v in self.sample_visits.items()},
+            'next_idx': self.next_idx,
+            'size': self.size,
+            'full': self.full,
+            'n_agents': self.n_agents,
+        }
+
+    def load_state_dict(self, state):
+        if state['n_agents'] != self.n_agents:
+            self.init_buffer(state['n_agents'], self.env_type)
+
+        size = state['size']
+        for name, arr in state['arrays'].items():
+            if arr is None:
+                continue
+            getattr(self, name)[:size] = arr
+
+        for k, v in state['sample_visits'].items():
+            self.sample_visits[k] = v.clone()
+
+        self.next_idx = state['next_idx']
+        self.size = size
+        self.full = state['full']
+
     def append(self, obs, shared_obs, next_shared_obs, action, reward, done, fake, last, av_action):
         if self.actions.shape[-2] != action.shape[-2]:
             self.init_buffer(action.shape[-2], self.env_type)

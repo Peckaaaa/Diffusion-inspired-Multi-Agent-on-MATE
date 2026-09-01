@@ -394,9 +394,41 @@ class DIMAWorldModel(WorldModel):
         # this object only ever runs forward passes.
         torch.autograd.set_detect_anomaly(False)
 
+        self._restore_state_rms(checkpoint_path)
+
         self._attach(
             self._learner, env, config, num_samples=num_samples, checkpoint_path=checkpoint_path
         )
+
+    def _restore_state_rms(self, checkpoint_path) -> None:
+        """Restore the state normaliser the checkpoint was trained with.
+
+        ``DreamerLearner.params`` saves ``state_rms`` (DreamerLearner.py:236) but
+        ``load_pretrained`` restores only the three modules, so a freshly built
+        learner keeps an untouched ``RunningMeanStd`` -- mean 0, var 1.  Every
+        denoiser call would then be conditioned on states normalised differently
+        from the ones it was trained on, which silently degrades every prediction
+        without raising anything.  Mid-training validation does not hit this
+        (:meth:`from_learner` reads the live learner), so it only ever showed up
+        in the evaluation runs that load a checkpoint.
+        """
+
+        from research.logging_utils import log
+
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        rms = ckpt.get('running_mean_std') if isinstance(ckpt, dict) else None
+        if rms is None:
+            log(
+                'WARN',
+                f'{checkpoint_path} carries no running_mean_std, so predictions use an '
+                f'unfitted state normaliser (mean 0, var 1) and will not match training.',
+            )
+            return
+
+        target = self._learner.state_rms
+        target.mean = np.asarray(rms.mean, dtype=np.float64)
+        target.var = np.asarray(rms.var, dtype=np.float64)
+        target.count = float(rms.count)
 
     def _attach(self, learner, env: MATEEnv, config, *, num_samples: int, checkpoint_path) -> None:
         """Bind to a learner's modules. Shared by the load path and :meth:`from_learner`."""

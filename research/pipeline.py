@@ -244,6 +244,8 @@ def run_pipeline(
     tensorboard: bool = False,
     force: bool = False,
     dry_run: bool = False,
+    resume: Optional[str] = None,
+    save_buffer: bool = False,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if preset not in PRESETS:
@@ -256,6 +258,11 @@ def run_pipeline(
     size.setdefault('min_buffer_size', None)
     size.update({k: v for k, v in (overrides or {}).items() if v is not None})
 
+    # A timestamped default means every invocation gets its own directory, so a
+    # re-run after a preemption starts from scratch instead of resuming.  Naming
+    # the run with --tag is what makes the stage skipping and the resumable
+    # checkpoint reachable a second time.
+    auto_tag = tag is None
     tag = tag or f'{scenario}-{preset}-s{seed}-{time.strftime("%Y%m%d-%H%M%S")}'
     run_root = Path(out_root) / tag
     dataset_dir = run_root / 'dataset'
@@ -273,6 +280,13 @@ def run_pipeline(
         min_buffer_size = required_buffer
 
     log('RUN', f'pipeline preset={preset} scenario={scenario} seed={seed} -> {run_root}')
+    if auto_tag:
+        log(
+            'WARN',
+            f'no --tag given, so this run directory is timestamped and a re-run after a '
+            f'preemption will not find it. Pass --tag {scenario}-{preset}-s{seed} to make '
+            f'the same command resume.',
+        )
     log(
         'RUN',
         f'plan: collect {size["episodes"]}x{size["max_episode_steps"]} steps '
@@ -361,13 +375,39 @@ def run_pipeline(
         ),
     )
 
+    # Stage-level skipping only helps once the stage finished. A job killed
+    # part-way through training left a resumable checkpoint behind, and picking it
+    # up is the difference between losing the passes already paid for and keeping
+    # them.
+    resume_checkpoint = wm_dir / 'ckpt' / train_wm.RESUME_CHECKPOINT_FILENAME
+    train_resume = str(resume_checkpoint) if resume_checkpoint.is_file() else resume
+
+    def train_finished() -> bool:
+        """``model_final.pth`` alone does not mean the passes were all run.
+
+        ``train_wm`` writes it on the way out of a run stopped by ``--max-hours``
+        too, so testing only for the file makes a preempted run look complete and
+        skips the stage that was supposed to continue it.  The resume sidecar
+        records how far the run actually got.
+        """
+
+        if not checkpoint.is_file():
+            return False
+        meta_path = wm_dir / 'ckpt' / train_wm.RESUME_META_FILENAME
+        if not meta_path.is_file():
+            return True
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        return int(meta.get('next_pass', 0)) >= int(meta.get('passes', 0))
+
     stage(
         'train',
-        checkpoint.is_file(),
+        train_finished(),
         lambda: str(
             train_wm.train(
                 dataset_dir,
                 wm_dir,
+                resume=train_resume,
+                save_buffer=save_buffer,
                 passes=size['passes'],
                 seed=seed,
                 device=device,
@@ -451,6 +491,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
     parser.add_argument('--force', action='store_true', help='re-run stages whose output exists')
+    parser.add_argument('--resume', default=None,
+                        help='continue training from a checkpoint elsewhere, e.g. '
+                             'wandb://entity/project/artifact:latest after the instance was lost. '
+                             'A resumable checkpoint already in the run directory is picked up '
+                             'automatically and takes precedence.')
+    parser.add_argument('--save-buffer', action='store_true',
+                        help='include the replay buffer in resumable checkpoints')
     parser.add_argument('--dry-run', action='store_true', help='print the resolved plan and exit')
 
     sizes = parser.add_argument_group('preset overrides (each defaults to the preset value)')
@@ -489,6 +536,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tensorboard=args.tensorboard,
         force=args.force,
         dry_run=args.dry_run,
+        resume=args.resume,
+        save_buffer=args.save_buffer,
         overrides={field: getattr(args, field) for field in _OVERRIDE_FIELDS},
     )
     return 0

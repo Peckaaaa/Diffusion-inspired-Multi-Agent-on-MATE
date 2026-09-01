@@ -18,7 +18,9 @@ MATE_COMMIT='3e631c0c3b043990fc53ae5fc3a37b0f65f230c5'
 
 # Files allowed to differ, per research/UPSTREAM_PATCHES.md.
 ACCEPTED='DIMA/environments.py
-DIMA/agent/learners/DreamerLearner.py'
+DIMA/agent/learners/DreamerLearner.py
+DIMA/dataset.py
+DIMA/agent/memory/DreamerMemory.py'
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

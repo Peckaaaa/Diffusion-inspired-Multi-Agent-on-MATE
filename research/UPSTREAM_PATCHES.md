@@ -1,11 +1,12 @@
 # Modifications to the upstream repositories
 
-Two files under `DIMA/` are modified. **`mate/` is byte-for-byte upstream.**
-Both edits are additive: they add a new branch that only fires for
-`Env.MATE`, and no existing code path changes behaviour.
+Four files under `DIMA/` are modified. **`mate/` is byte-for-byte upstream.**
+Every edit is additive -- a new `Env.MATE` branch, or a new method -- and no
+existing code path changes behaviour.
 
-The combined patch is kept as [`upstream-patches.diff`](upstream-patches.diff) so
-it can be re-applied after rebasing onto a newer upstream:
+[`upstream-patches.diff`](upstream-patches.diff) currently carries patches 1 and 2
+only; regenerate it against the pinned commits to include the checkpointing
+methods of patch 3. It can be re-applied after rebasing onto a newer upstream:
 
 ```bash
 git apply research/upstream-patches.diff
@@ -46,7 +47,7 @@ upstream is cheaper than a permanently confusing audit trail.
 
 ---
 
-## 2. `DIMA/agent/learners/DreamerLearner.py` — 15 lines
+## 2. `DIMA/agent/learners/DreamerLearner.py` — 15 lines (`add_experience_to_dataset`)
 
 Adds an `elif self.env_type == Env.MATE:` branch to `add_experience_to_dataset()`
 that builds a `MamujocoEpisode` from the rollout dictionary.
@@ -77,6 +78,35 @@ shape. Adding a `MATEEpisode` would have duplicated `MamujocoEpisode.segment()` 
 `__len__()` verbatim — brief section 10 says to adapt MATE into DIMA's existing
 abstraction rather than introducing another one. The new branch is a copy of the
 MAMuJoCo branch because the data shape is genuinely identical; only the label differs.
+
+---
+
+## 3. Resumable checkpointing — `DreamerLearner.py`, `dataset.py`, `DreamerMemory.py`
+
+Adds `training_state()` / `save_full()` / `load_full()` to `DreamerLearner`, and a
+`state_dict()` / `load_state_dict()` pair to `MultiAgentEpisodesDataset`
+(`DIMA/dataset.py`) and `DreamerMemory` so the replay buffers can travel inside
+that checkpoint.
+
+### Why an adapter cannot solve this
+
+`DreamerLearner.save()` writes weights only: no optimiser state, no LR-schedule
+state, no RNG, no counters, and in particular not the `cur_wandb_epoch` /
+`accum_samples` / `train_count` fields that decide what `step()` does next. A run
+restarted from `save()` therefore restarts DIMA's schedule from its first-epoch
+branch on already-trained weights, which is not a resume. Reconstructing all of
+that from outside would mean reaching into private attributes of five modules and
+two buffers, and would break silently whenever upstream adds one.
+
+The methods are additive: nothing upstream calls them, and `save()` /
+`load_pretrained()` are untouched, so the existing training and evaluation paths
+behave exactly as before.
+
+### Scope
+
+`research/train_wm.py --resume` is the only caller. The replay buffer is included
+only when `--save-buffer` is passed, because `MultiAgentEpisodesDataset` holds raw
+rollouts and the checkpoint would otherwise grow by gigabytes.
 
 ---
 

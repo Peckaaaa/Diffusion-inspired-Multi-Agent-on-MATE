@@ -1,3 +1,4 @@
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -262,6 +263,100 @@ class DreamerLearner:
 
     def save(self, save_path):
         torch.save(self.params(), save_path)
+
+    # ---- full training-state checkpointing (resume after an interrupted run) ----
+
+    # Everything that has to survive a restart for training to continue identically.
+    _CKPT_MODULES = ('state_decoder', 'denoiser', 'rew_end_model', 'actor', 'critic',
+                     'old_critic', 'value_normalizer')
+    _CKPT_OPTIMIZERS = ('state_decoder_optimizer', 'denoiser_opt', 'rew_end_model_opt',
+                        'actor_optimizer', 'critic_optimizer')
+    _CKPT_COUNTERS = ('step_count', 'train_count', 'cur_wandb_epoch', 'cur_update',
+                      'accum_samples', 'total_samples', 'n_agents', 'entropy',
+                      'train_ac_only', 'evaluate')
+
+    def training_state(self, save_buffer=False):
+        state = {
+            'modules': {name: getattr(self, name).state_dict() for name in self._CKPT_MODULES},
+            'optimizers': {name: getattr(self, name).state_dict() for name in self._CKPT_OPTIMIZERS},
+            'counters': {name: getattr(self, name) for name in self._CKPT_COUNTERS},
+            'state_rms': {'mean': self.state_rms.mean, 'var': self.state_rms.var, 'count': self.state_rms.count},
+            'num_batch_train': self.num_batch_train.state_dict(),
+            'torch_rng': torch.get_rng_state(),
+            'numpy_rng': np.random.get_state(),
+        }
+
+        if self.denoiser_lr_sched is not None:
+            state['denoiser_lr_sched'] = self.denoiser_lr_sched.state_dict()
+
+        if torch.cuda.is_available():
+            state['cuda_rng'] = torch.cuda.get_rng_state_all()
+
+        if save_buffer:
+            state['replay_buffer'] = self.replay_buffer.state_dict()
+            state['mamba_replay_buffer'] = self.mamba_replay_buffer.state_dict()
+
+        return state
+
+    def save_full(self, save_path, runner_state=None, save_buffer=False):
+        """Write a resumable checkpoint atomically, so an interrupt mid-write
+        cannot leave a truncated file where the previous good one was."""
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ckpt = {'learner': self.training_state(save_buffer=save_buffer),
+                'runner': runner_state,
+                'has_buffer': save_buffer}
+
+        tmp_path = save_path.with_suffix(save_path.suffix + '.tmp')
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, save_path)
+
+    def load_full(self, load_path):
+        """Restore a checkpoint written by save_full. Returns the runner state.
+
+        Unlike load_pretrained this keeps the learner in training mode: it is a
+        resume, not an evaluation of frozen weights.
+        """
+        print(f"Resuming from {load_path}")
+        ckpt = torch.load(load_path, map_location=self.config.DEVICE, weights_only=False)
+        state = ckpt['learner']
+
+        for name, sd in state['modules'].items():
+            getattr(self, name).load_state_dict(sd)
+
+        for name, sd in state['optimizers'].items():
+            getattr(self, name).load_state_dict(sd)
+
+        for name, value in state['counters'].items():
+            setattr(self, name, value)
+
+        rms = state['state_rms']
+        self.state_rms.mean, self.state_rms.var, self.state_rms.count = rms['mean'], rms['var'], rms['count']
+        self.num_batch_train.load_state_dict(state['num_batch_train'])
+
+        if 'denoiser_lr_sched' in state and self.denoiser_lr_sched is not None:
+            self.denoiser_lr_sched.load_state_dict(state['denoiser_lr_sched'])
+
+        torch.set_rng_state(state['torch_rng'].cpu().to(torch.uint8))
+        np.random.set_state(state['numpy_rng'])
+        if 'cuda_rng' in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state['cuda_rng'])
+
+        if ckpt.get('has_buffer'):
+            self.replay_buffer.load_state_dict(state['replay_buffer'])
+            self.mamba_replay_buffer.load_state_dict(state['mamba_replay_buffer'])
+            print(f"Replay buffer restored: {self.replay_buffer.num_steps} steps, {len(self.replay_buffer)} episodes.")
+        else:
+            print("Checkpoint holds no replay buffer; it will refill before training resumes.")
+
+        # The world models are kept in eval mode outside their own training loops,
+        # matching how __init__ leaves them.
+        self.state_decoder.eval()
+        self.denoiser.eval()
+        self.rew_end_model.eval()
+
+        return ckpt.get('runner')
 
     def normalize_state(self, state):
         b, t, d = state.shape

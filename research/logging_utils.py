@@ -164,6 +164,37 @@ def dependency_versions() -> Dict[str, Optional[str]]:
 # --------------------------------------------------------------------------- #
 
 
+WANDB_REF_PREFIX = 'wandb://'
+WANDB_RUN_ID_FILENAME = 'wandb_run_id.txt'
+
+
+def read_wandb_run_id(run_dir: Path | str) -> Optional[str]:
+    """The wandb run this directory belongs to, if one was recorded."""
+
+    path = Path(run_dir) / WANDB_RUN_ID_FILENAME
+    return path.read_text(encoding='utf-8').strip() or None if path.is_file() else None
+
+
+def write_wandb_run_id(run_dir: Path | str, run_id: str) -> None:
+    (Path(run_dir) / WANDB_RUN_ID_FILENAME).write_text(str(run_id), encoding='utf-8')
+
+
+def download_checkpoint_artifact(ref: str, dest_dir: Path | str) -> Path:
+    """Fetch a checkpoint artifact version from wandb into ``dest_dir``.
+
+    This is the path that matters when the instance that produced the checkpoint
+    is gone: its run directory went with it, and wandb holds the only copy.
+    Returns the directory the version was downloaded into.
+    """
+
+    import wandb
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    artifact = wandb.Api().artifact(ref, type='world-model')
+    return Path(artifact.download(root=str(dest_dir)))
+
+
 class RunLogger:
     """One run directory + console + wandb + DIMA's TensorBoard logger.
 
@@ -187,6 +218,7 @@ class RunLogger:
         tensorboard: bool = False,
         project: str = 'dima-mate',
         group: Optional[str] = None,
+        resume_run_id: Optional[str] = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +231,8 @@ class RunLogger:
         import wandb
 
         self._wandb = wandb
+        # Resuming into the original run keeps one continuous set of curves rather
+        # than splitting a preempted job's history across two wandb runs.
         wandb.init(
             project=project,
             group=group,
@@ -207,7 +241,13 @@ class RunLogger:
             config=dict(config or {}),
             dir=str(self.run_dir),
             reinit=True,
+            id=resume_run_id,
+            resume='must' if resume_run_id is not None else None,
         )
+
+        # Recorded so a restart in this directory can find the run again.
+        if wandb.run is not None and getattr(wandb.run, 'id', None):
+            write_wandb_run_id(self.run_dir, wandb.run.id)
 
         from tb_logger import LOGGER
 
@@ -225,6 +265,12 @@ class RunLogger:
             'compat_shims': research.COMPAT_SHIMS,
             'config': dict(config or {}),
         }
+
+    @property
+    def wandb_run(self):
+        """The live wandb run, or None when wandb produced no run."""
+
+        return self._wandb.run
 
     # -- manifest ----------------------------------------------------------- #
 

@@ -62,14 +62,82 @@ def parse_args():
     parser.add_argument('--load_pretrained', action='store_true', default=False)
     parser.add_argument('--load_path', type=str, default=None)
 
+    # Resume an interrupted run: full training state, not just weights.
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a ckpt/latest.pth written by save_full, or the run directory holding it')
+    parser.add_argument('--save_buffer', action='store_true', default=False,
+                        help='Include the replay buffer in resumable checkpoints (large, but avoids refilling)')
+    parser.add_argument('--wandb_ckpt', action='store_true', default=False,
+                        help='Upload each resumable checkpoint to wandb as an artifact')
+
     parser.add_argument('--use_tensorboard', action='store_true')
 
     return parser.parse_args()
 
 
-def train_dreamer(exp, n_workers): 
-    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers)
-    runner.run(exp.steps, exp.episodes, save_interval = 200000, save_mode = 'interval')
+WANDB_RESUME_PREFIX = "wandb://"
+
+
+def resolve_resume_path(resume):
+    """Locate a resumable checkpoint.
+
+    Accepts the checkpoint file, the run directory holding it, or a wandb
+    artifact reference "wandb://entity/project/artifact:alias" - the last of
+    which matters when the machine that produced the checkpoint is gone.
+
+    Returns (path, from_wandb, wandb_run_id). from_wandb tells the caller the
+    original run directory is unavailable and a new one has to be created;
+    wandb_run_id names the run the artifact came from, so its curves continue.
+    """
+    if resume is None:
+        return None, False, None
+
+    if str(resume).startswith(WANDB_RESUME_PREFIX):
+        import wandb
+
+        ref = str(resume)[len(WANDB_RESUME_PREFIX):]
+        download_root = Path(os.path.dirname(os.path.abspath(__file__))) / "wandb_resume"
+        download_root.mkdir(parents=True, exist_ok=True)
+
+        print(f"Downloading checkpoint artifact {ref} from wandb...")
+        artifact_dir = Path(wandb.Api().artifact(ref, type="model").download(root=str(download_root)))
+        path = artifact_dir / "latest.pth"
+
+        if not path.is_file():
+            raise FileNotFoundError(f"Artifact {ref} holds no latest.pth")
+
+        # Artifacts are named ckpt-<wandb run id>, so the originating run is
+        # recoverable even though its machine and directory are not.
+        artifact_name = ref.split("/")[-1].split(":")[0]
+        wandb_run_id = artifact_name[len("ckpt-"):] if artifact_name.startswith("ckpt-") else None
+
+        return str(path), True, wandb_run_id
+
+    path = Path(resume)
+    if path.is_dir():
+        path = path / "ckpt" / "latest.pth"
+
+    if not path.is_file():
+        raise FileNotFoundError(f"No resumable checkpoint at {path}")
+
+    return str(path), False, None
+
+
+def read_wandb_run_id(run_dir):
+    """The id of the wandb run this directory belongs to, if one was recorded."""
+    id_file = Path(run_dir) / "wandb_run_id.txt"
+    return id_file.read_text().strip() if id_file.is_file() else None
+
+
+def write_wandb_run_id(run_dir, run_id):
+    (Path(run_dir) / "wandb_run_id.txt").write_text(str(run_id))
+
+
+def train_dreamer(exp, n_workers, resume_path=None, save_buffer=False, wandb_ckpt=False): 
+    runner = DreamerRunner(exp.env_config, exp.learner_config, exp.controller_config, n_workers,
+                           resume_path=resume_path)
+    runner.run(exp.steps, exp.episodes, save_interval = 200000, save_mode = 'interval',
+               save_buffer = save_buffer, wandb_ckpt = wandb_ckpt)
 
 
 def get_env_info(configs, env):
@@ -232,29 +300,37 @@ if __name__ == "__main__":
     # make run directory
     dir_prefix = args.env_name + '-'+ args.agent_conf if args.agent_conf is not None else args.env_name
 
-    run_dir = Path(os.path.dirname(os.path.abspath(__file__)) + f"/{current_date_string}_results") / args.env / (dir_prefix)
-    # curr_run = f"run{random.randint(1000, 9999)}"
-    if not run_dir.exists():
-        curr_run = 'run1'
+    resume_path, resume_from_wandb, resume_wandb_run_id = resolve_resume_path(args.resume)
+
+    if resume_path is not None and not resume_from_wandb:
+        # Continue inside the run the checkpoint came from: <run_dir>/ckpt/latest.pth
+        # The run's source snapshot is already there, so nothing is copied again.
+        run_dir = Path(resume_path).parent.parent
+        print(f"Resuming run at {run_dir}\n")
+
     else:
-        exst_run_nums = [int(str(folder.name).split('run')[1]) for folder in run_dir.iterdir() if
-                            str(folder.name).startswith('run')]
-        if len(exst_run_nums) == 0:
+        run_dir = Path(os.path.dirname(os.path.abspath(__file__)) + f"/{current_date_string}_results") / args.env / (dir_prefix)
+        if not run_dir.exists():
             curr_run = 'run1'
         else:
-            curr_run = 'run%i' % (max(exst_run_nums) + 1)
-    
-    run_dir = run_dir / curr_run
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
-        os.makedirs(str(run_dir / "ckpt"))
+            exst_run_nums = [int(str(folder.name).split('run')[1]) for folder in run_dir.iterdir() if
+                                str(folder.name).startswith('run')]
+            if len(exst_run_nums) == 0:
+                curr_run = 'run1'
+            else:
+                curr_run = 'run%i' % (max(exst_run_nums) + 1)
 
-    shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "agent"), dst=run_dir / "agent")
-    shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "configs"), dst=run_dir / "configs")
-    shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "networks"), dst=run_dir / "networks")
-    shutil.copyfile(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "train.py"), dst=run_dir / "train.py")
-    
-    print(f"Run files are saved at {str(run_dir)}\n")
+        run_dir = run_dir / curr_run
+        if not run_dir.exists():
+            os.makedirs(str(run_dir))
+            os.makedirs(str(run_dir / "ckpt"))
+
+        shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "agent"), dst=run_dir / "agent")
+        shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "configs"), dst=run_dir / "configs")
+        shutil.copytree(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "networks"), dst=run_dir / "networks")
+        shutil.copyfile(src=(Path(os.path.dirname(os.path.abspath(__file__))) / "train.py"), dst=run_dir / "train.py")
+
+        print(f"Run files are saved at {str(run_dir)}\n")
     # -------------------
 
     configs["learner_config"].RUN_DIR = str(run_dir)
@@ -305,6 +381,15 @@ if __name__ == "__main__":
 
     global wandb
     import wandb
+    # Resuming into the original wandb run keeps one continuous set of curves
+    # instead of splitting the training history across two runs.
+    if resume_from_wandb:
+        prev_wandb_run_id = resume_wandb_run_id
+    elif resume_path is not None:
+        prev_wandb_run_id = read_wandb_run_id(run_dir)
+    else:
+        prev_wandb_run_id = None
+
     wandb.init(
         project='SMAD' if args.env != Env.MAMUJOCO else 'mamujoco',
         mode=args.mode if not args.load_pretrained else 'disabled',
@@ -313,7 +398,12 @@ if __name__ == "__main__":
         name=run_name,
         config=configs["learner_config"].to_dict(),
         notes="",
+        id=prev_wandb_run_id,
+        resume="must" if prev_wandb_run_id is not None else None,
     )
+
+    if wandb.run is not None and wandb.run.id is not None:
+        write_wandb_run_id(run_dir, wandb.run.id)
 
     print("group name: ", group_name)
     print("run name: ", run_name)
@@ -333,4 +423,5 @@ if __name__ == "__main__":
                      controller_config=configs["controller_config"],
                      learner_config=configs["learner_config"])
 
-    train_dreamer(exp, n_workers=args.n_workers)
+    train_dreamer(exp, n_workers=args.n_workers, resume_path=resume_path, save_buffer=args.save_buffer,
+                  wandb_ckpt=args.wandb_ckpt)

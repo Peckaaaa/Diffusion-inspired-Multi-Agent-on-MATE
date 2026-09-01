@@ -7,12 +7,14 @@ The design constraint is that neither upstream repository is rewritten:
 
 ```
         official DIMA          +          official MATE          +          research/
-   (vendored, 2 lines patched)      (vendored, unmodified)          (all integration code)
+   (vendored, 4 files patched)      (vendored, unmodified)          (all integration code)
 ```
 
 `DIMA/` and `mate/` are byte-for-byte upstream at the commits recorded in
-[`UPSTREAM.md`](UPSTREAM.md), except for two additive branches in DIMA documented
-and justified in [`research/UPSTREAM_PATCHES.md`](research/UPSTREAM_PATCHES.md).
+[`UPSTREAM.md`](UPSTREAM.md), except for three additive patches in DIMA -- the
+`Env.MATE` member, the episode branch that consumes MATE rollouts, and resumable
+checkpointing -- documented and justified in
+[`research/UPSTREAM_PATCHES.md`](research/UPSTREAM_PATCHES.md).
 `bash research/scripts/verify_upstream.sh` proves it.
 
 > **Status: research scaffolding, verified end-to-end.** The pipeline runs and the
@@ -185,8 +187,12 @@ GPU.
 ### One command
 
 ```bash
-nohup python -m research.pipeline --preset server --max-hours 20 > pipeline.log 2>&1 &
+nohup python -m research.pipeline --preset server --tag 4v8-s0 --max-hours 20 > pipeline.log 2>&1 &
 ```
+
+`--tag` names the run directory. Without it the directory is timestamped, every
+invocation gets a fresh one, and none of the resuming below can find the previous
+attempt -- so on a preemptible box it is not optional.
 
 `research/pipeline.py` runs collect → train → evaluate into one run directory and
 writes `pipeline.json` recording what was asked for, what ran, how long it took
@@ -203,9 +209,12 @@ runs/<scenario>-<preset>-s<seed>-<timestamp>/
 ```
 
 A stage whose output already exists is skipped, so re-running the identical
-command after a preemption continues rather than starting over (`--force`
-re-runs, `--stages collect,train` runs a subset). `--dry-run` prints the resolved
-plan and exits.
+command (same `--tag`) after a preemption continues rather than starting over
+(`--force` re-runs, `--stages collect,train` runs a subset). `--dry-run` prints
+the resolved plan and exits. The train stage counts as done only once
+`ckpt/resume_meta.json` says every pass ran: a run stopped by `--max-hours` also
+writes `model_final.pth`, and testing for that file alone would make a half-
+trained run look finished.
 
 ### Getting the checkpoints off a rented box
 

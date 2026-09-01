@@ -81,15 +81,57 @@ class DreamerServer:
 
 class DreamerRunner:
 
-    def __init__(self, env_config, learner_config, controller_config, n_workers):
+    def __init__(self, env_config, learner_config, controller_config, n_workers, resume_path=None):
         self.n_workers = n_workers
         self.learner = learner_config.create_learner()
+
+        # Restore before the workers start, so their very first rollout already
+        # uses the resumed policy rather than freshly initialised weights.
+        self._resume_runner_state = self.learner.load_full(resume_path) if resume_path is not None else None
+
         self.server = DreamerServer(n_workers, env_config, controller_config, self.learner.params())
 
         self.save_path = Path(learner_config.RUN_DIR).parent / f"DIMA_{learner_config.map_name}_seed{learner_config.seed}.pkl"
         self.env_type = controller_config.ENV_TYPE
         
-    def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval"):
+    @staticmethod
+    def _runner_state(cur_steps, cur_episode, save_interval_steps, last_save_steps,
+                      last_eval_steps, last_validate_steps, steps, eval_win_rates, eval_returns):
+        return {
+            'cur_steps': cur_steps,
+            'cur_episode': cur_episode,
+            'save_interval_steps': save_interval_steps,
+            'last_save_steps': last_save_steps,
+            'last_eval_steps': last_eval_steps,
+            'last_validate_steps': last_validate_steps,
+            'steps': list(steps),
+            'eval_win_rates': list(eval_win_rates),
+            'eval_returns': list(eval_returns),
+        }
+
+    def _save_resumable(self, runner_state):
+        """Write the resumable checkpoint, and mirror it to wandb when asked.
+
+        Upload failures are reported but never abort training: the local
+        checkpoint is already on disk and is the one resume reads by default.
+        """
+        self.learner.save_full(self.full_ckpt_path, runner_state=runner_state, save_buffer=self.save_buffer)
+
+        if not self.wandb_ckpt or wandb.run is None:
+            return
+
+        try:
+            artifact = wandb.Artifact(f"ckpt-{wandb.run.id}", type="model",
+                                      metadata={'steps': runner_state['cur_steps'],
+                                                'episodes': runner_state['cur_episode'],
+                                                'has_buffer': self.save_buffer})
+            artifact.add_file(str(self.full_ckpt_path), name="latest.pth")
+            wandb.log_artifact(artifact, aliases=["latest", f"step-{runner_state['cur_steps']}"])
+        except Exception as e:
+            print(f"Failed to upload checkpoint artifact to wandb: {e}")
+
+    def run(self, max_steps=10 ** 10, max_episodes=10 ** 10, save_interval= 10000, save_mode="interval",
+            save_buffer=False, wandb_ckpt=False):
         cur_steps, cur_episode = 0, 0
         save_interval_steps = 0
         last_save_steps = 0
@@ -99,6 +141,23 @@ class DreamerRunner:
         eval_win_rates = []
         eval_ret_list  = []
         steps = []
+
+        self.save_buffer = save_buffer
+        self.wandb_ckpt = wandb_ckpt
+        self.full_ckpt_path = Path(self.learner.config.RUN_DIR) / "ckpt" / "latest.pth"
+
+        runner_state = self._resume_runner_state
+        if runner_state is not None:
+            cur_steps           = runner_state['cur_steps']
+            cur_episode         = runner_state['cur_episode']
+            save_interval_steps = runner_state['save_interval_steps']
+            last_save_steps     = runner_state['last_save_steps']
+            last_eval_steps     = runner_state['last_eval_steps']
+            last_validate_steps = runner_state['last_validate_steps']
+            steps          = list(runner_state['steps'])
+            eval_win_rates = list(runner_state['eval_win_rates'])
+            eval_ret_list  = list(runner_state['eval_returns'])
+            print(f"Resumed at episode {cur_episode}, {cur_steps} env steps.")
 
         wandb.define_metric("steps")
         wandb.define_metric("reward", step_metric="steps")
@@ -145,6 +204,10 @@ class DreamerRunner:
             if (save_interval_steps - last_save_steps) > save_interval and save_mode == "interval":
                 self.learner.save(self.learner.config.RUN_DIR + f"/ckpt/model_{save_interval_steps // 1000}Ksteps.pth")
                 last_save_steps = save_interval_steps // save_interval * save_interval
+                self._save_resumable(
+                    self._runner_state(cur_steps, cur_episode, save_interval_steps, last_save_steps,
+                                       last_eval_steps, last_validate_steps,
+                                       steps, eval_win_rates, eval_ret_list))
 
             ## evaluation
             if (save_interval_steps - last_eval_steps) > 1000:
@@ -179,6 +242,10 @@ class DreamerRunner:
 
             if cur_episode >= max_episodes or cur_steps >= max_steps:
                 self.learner.save(self.learner.config.RUN_DIR + f"/ckpt/model_final.pth")
+                self._save_resumable(
+                    self._runner_state(cur_steps, cur_episode, save_interval_steps, last_save_steps,
+                                       last_eval_steps, last_validate_steps,
+                                       steps, eval_win_rates, eval_ret_list))
                 # self.learner.visualize_attention_map(-1, save_mode='final')
                 break
             
