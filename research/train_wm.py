@@ -68,7 +68,7 @@ def build_env_from_manifest(manifest: Dict, *, seed: int = 0) -> MATEEnv:
     )
 
 
-def minimum_buffer_steps(config) -> int:
+def minimum_buffer_steps(horizon: int) -> int:
     """Smallest replay buffer ``DreamerLearner.step`` can actually train from.
 
     ``DreamerMemory.sample_indices`` raises a bare ``ValueError('Not enough data
@@ -83,10 +83,12 @@ def minimum_buffer_steps(config) -> int:
     The second dominates: ``128 * horizon <= size - horizon + 1``.  Computing the
     bound here turns a confusing crash deep inside DIMA into an up-front, named
     constraint.
+
+    Takes the horizon rather than a config so ``research.pipeline`` can size a
+    preset before any DIMA config exists.
     """
 
-    horizon = int(config.horizon)
-    return max(256, 129 * horizon - 1)
+    return max(256, 129 * int(horizon) - 1)
 
 
 def check_dataset(manifest: Dict, rollouts, env: MATEEnv) -> None:
@@ -172,7 +174,7 @@ def train(
         config.DEVICE, detect_anomaly=detect_anomaly, threads=threads, seed=seed
     )
 
-    required = minimum_buffer_steps(config)
+    required = minimum_buffer_steps(config.horizon)
     if config.MIN_BUFFER_SIZE < required:
         log(
             'WARN',
@@ -237,6 +239,11 @@ def train(
         from agent.learners.DreamerLearner import DreamerLearner
 
         learner = DreamerLearner(config)
+        # DIMA draws a tqdm bar per inner training step (DreamerLearner.py:315, 358,
+        # 417) -- several hundred per episode.  On a terminal that is the progress
+        # display; redirected to a server log file it is hundreds of megabytes of
+        # carriage returns, so it is kept only when stdout is a terminal.
+        learner.tqdm_vis = sys.stdout.isatty()
         # DreamerLearner.__init__ re-enables anomaly detection (line 83); undo it
         # unless it was explicitly asked for.
         configure_torch(config.DEVICE, detect_anomaly=detect_anomaly, threads=threads)

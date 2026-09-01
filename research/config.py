@@ -151,13 +151,22 @@ def configure_torch(
         torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
         if hasattr(torch, 'set_float32_matmul_precision'):
             torch.set_float32_matmul_precision(matmul_precision)
+        # TF32 is an Ampere-and-later tensor-core format: compute capability 8.0+
+        # (RTX 30 = 8.6, RTX 40 = 8.9, RTX 50 = 12.0).  On Turing and older the
+        # flags above are accepted and silently do nothing, so the manifest must
+        # not record TF32 as active there -- the whole point of writing it down is
+        # to know afterwards which run got the speedup.
+        major, minor = torch.cuda.get_device_capability(0)
+        tf32_supported = major >= 8
         applied.update(
-            tf32=bool(tf32),
+            tf32=bool(tf32) and tf32_supported,
+            tf32_requested=bool(tf32),
+            tf32_supported=tf32_supported,
             cudnn_benchmark=bool(cudnn_benchmark),
             matmul_precision=matmul_precision,
             gpu_name=torch.cuda.get_device_name(0),
             gpu_count=torch.cuda.device_count(),
-            gpu_capability='.'.join(str(x) for x in torch.cuda.get_device_capability(0)),
+            gpu_capability=f'{major}.{minor}',
             gpu_total_memory_gb=round(
                 torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
             ),

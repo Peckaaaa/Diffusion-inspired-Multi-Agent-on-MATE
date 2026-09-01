@@ -21,29 +21,112 @@ and justified in [`research/UPSTREAM_PATCHES.md`](research/UPSTREAM_PATCHES.md).
 
 ---
 
-## The pipeline
+## How it fits together
+
+### The run, end to end
+
+One command drives three stages. Each box is the module that owns it; each
+cylinder is what survives on disk, so any stage can be re-entered on its own.
 
 ```mermaid
 flowchart TD
-    ENV["MATE MultiAgentTracking<br/>DiscreteCamera · MultiCamera · RepeatedRewardIndividualDone"]
+    CMD(["python -m research.pipeline --preset server"]):::entry
+
+    subgraph collect["stage 1 · collect — research/collect.py"]
+        direction TB
+        MIX["policy mix<br/>reactive_greedy 0.40 · heuristic 0.20<br/>random 0.25 · mate_random 0.15"]
+        RUN1["rollout.run_episode<br/>the same loop evaluation uses"]
+        CONV["rollout.to_dima_rollout<br/>exactly what DreamerLearner.step eats"]
+        MIX --> RUN1 --> CONV
+    end
+
+    subgraph train["stage 2 · train — research/train_wm.py"]
+        direction TB
+        SPLIT["deterministic tail split<br/>train episodes | held-out episodes"]
+        STEP["DreamerLearner.step<br/>DIMA, unmodified"]
+        VALID["validation.validate on held-out data<br/>sighting_recall · ade · sensitivity_ratio"]
+        SPLIT --> STEP --> VALID
+        VALID -. "next pass" .-> STEP
+    end
+
+    subgraph evaluate["stage 3 · evaluate — research/evaluate.py"]
+        direction TB
+        MATRIX["baseline matrix — one row per planner x world model<br/>random · mate_random · reactive_greedy · predictive_greedy · oracle"]
+        CLOSED["rollout.run_episode, closed loop"]
+        DIAGS["diagnostics.py<br/>prediction error · action sensitivity<br/>action ranking · validity"]
+        MATRIX --> CLOSED --> DIAGS
+    end
+
+    DS[("dataset/<br/>episode_*.npz + manifest.json")]
+    CK[("wm/ckpt/<br/>model_final.pth + config.json")]
+    EV[("eval/<br/>summaries.jsonl + manifest.json")]
+    PJ[("pipeline.json<br/>plan · timings · provenance")]
+
+    CMD --> collect --> DS --> train --> CK --> evaluate --> EV
+    CMD -.-> PJ
+    DS -. "skipped if present" .-> train
+    CK -. "skipped if present" .-> evaluate
+
+    classDef entry fill:#eef,stroke:#559
+```
+
+### Inside the loop
+
+`SceneView` is the only thing a planner reasons about, and it is built the same
+way from a *real* observation and from a *predicted* one — which is what makes
+swapping the world model a controlled comparison.
+
+```mermaid
+flowchart TD
+    ENV["MATE MultiAgentTracking<br/>DiscreteCamera(5) · MultiCamera · RepeatedRewardIndividualDone"]
     AD["MATEEnv adapter<br/>research/env_adapter.py"]
-    OBS["MATEObservation<br/>obs (decentralised) | state (PRIVILEGED)"]
-    WM["World model<br/>research/world_model.py"]
-    PRED["Prediction<br/>observations in MATE units"]
-    DIAG["Diagnostics<br/>research/diagnostics.py"]
-    PLAN["Planner<br/>research/planners.py"]
+    OBS["MATEObservation<br/>obs — decentralised, (C, 126)<br/>state — PRIVILEGED, (220,)"]
+    HIST["History<br/>conditioning window of states + actions"]
+    WM{{"WorldModel.predict<br/>history, candidate actions, horizon"}}
+    PRED["Prediction<br/>observations in MATE world units"]
+    VIEW["SceneView<br/>research/views.py — cameras, targets, margins"]
+    PLAN["Planner.plan<br/>research/planners.py"]
+    DIAG["diagnostics.py / validation.py"]
 
-    ENV --> AD --> OBS --> WM --> PRED --> DIAG
-    PRED --> PLAN
-    OBS --> PLAN
-    PLAN -->|"joint Discrete(25)"| ENV
+    ENV --> AD --> OBS
+    OBS --> HIST --> WM --> PRED
+    PRED --> VIEW
+    OBS --> VIEW
+    VIEW --> PLAN
+    PRED --> DIAG
+    PLAN -->|"joint action, Discrete(25) per camera"| ENV
 
-    subgraph models["World model implementations — same interface"]
-        DIMA["DIMAWorldModel<br/>DIMA denoiser + VQ decoder + rew/end transformer"]
+    subgraph models["World model implementations — one interface, swapped by --world-model"]
+        direction LR
+        DIMA["DIMAWorldModel<br/>VQ decoder + diffusion denoiser<br/>+ rew/end transformer"]
         ORACLE["OracleWorldModel<br/>forks the real MATE env"]
         ALPHA["AlphaOracleWorldModel<br/>action signal scaled by alpha"]
     end
     models -.-> WM
+
+    subgraph planners["Planners — swapped by --planner, never by editing the loop"]
+        direction LR
+        RG["MATE's own agents<br/>Random · Naive · Greedy · Heuristic"]
+        MB["ModelBasedGreedyPlanner<br/>coordinate descent over C x 25"]
+    end
+    planners -.-> PLAN
+```
+
+### Where DIMA's modules sit
+
+```mermaid
+flowchart LR
+    ROLL["DIMA rollout dict<br/>observation · shared_obs · action · reward · done"]
+    BUF["MultiAgentEpisodesDataset<br/>+ DreamerMemory"]
+    VQ["SimpleVQAutoEncoder<br/>state -> joint observation"]
+    DEN["Denoiser + DiffusionSampler<br/>next global state"]
+    RE["TransRewEndModel<br/>reward · continuation"]
+    CKPT[("checkpoint + config.json sidecar<br/>horizon, dims, vq type")]
+
+    ROLL --> BUF
+    BUF --> VQ & DEN & RE
+    VQ & DEN & RE --> CKPT
+    CKPT -->|"DIMAWorldModel loads"| USE["closed-loop planning<br/>and diagnostics"]
 ```
 
 The planner is swapped by name, never by editing the loop:
@@ -97,7 +180,87 @@ RESEARCH_SLOW_TESTS=1 python -m unittest tests.test_research   # + the full pipe
 ## Running on a GPU server
 
 The laptop path above exists to prove the pipeline; real training belongs on a
-GPU. Three things are set up for that, and one of them matters a lot.
+GPU.
+
+### One command
+
+```bash
+nohup python -m research.pipeline --preset server --max-hours 20 > pipeline.log 2>&1 &
+```
+
+`research/pipeline.py` runs collect → train → evaluate into one run directory and
+writes `pipeline.json` recording what was asked for, what ran, how long it took
+and what it produced. It implements no new behaviour: each stage is the entry
+point documented above, called with the same arguments, so a stage run by hand
+and the same stage run by the pipeline are the same code path.
+
+```
+runs/<scenario>-<preset>-s<seed>-<timestamp>/
+    pipeline.json
+    dataset/   episode_*.npz + manifest.json
+    wm/        ckpt/, wm_validation.jsonl, dima_scalars.jsonl, manifest.json
+    eval/      summaries.jsonl, diagnostics, manifest.json
+```
+
+A stage whose output already exists is skipped, so re-running the identical
+command after a preemption continues rather than starting over (`--force`
+re-runs, `--stages collect,train` runs a subset). `--dry-run` prints the resolved
+plan and exits.
+
+| preset | sizes |
+|---|---|
+| `smoke` | 12 × 100 steps, 1 pass, 1 × 25-step evaluation — proves the three stages wire together |
+| `laptop` | the quick start above: 300 episodes, 1 pass, shortened DIMA schedule |
+| `server` | 400 episodes, 20 passes, **DIMA's own unshortened schedule** (`N_SAMPLES=100`, `WM_EPOCHS=200`, `denoiser_steps_first_epoch=200`, `remodel_steps=60`) |
+
+The pipeline's default scenario is **`MATE-4v8-9`** — 4 cameras, 8 targets, 9
+obstacles, `obs_dim=126`, `state_dim=220`, `|A|=25`, all detected off the live
+environment. `research.env_adapter.DEFAULT_SCENARIO` stays `MATE-4v2-9` because
+the verified numbers below were measured on it; pass `--scenario` to either.
+
+**Do the arithmetic before you start `server`.** `DreamerLearner.step` trains
+whenever `accum_samples ≥ N_SAMPLES`, and `N_SAMPLES=100` against 200-step
+episodes means **one training round per episode**. Each round is
+`WM_EPOCHS + WM_EPOCHS + remodel_steps = 200 + 200 + 60 = 460` optimiser steps
+(the `*_first_epoch` counts apply only to the very first round —
+`cur_wandb_epoch` increments at the end of each one). So 400 episodes × 20 passes
+is 8 000 rounds ≈ **3.7 M optimiser steps**, which is far more than a first
+experiment needs.
+
+Replaying a fixed dataset is not the online setting `N_SAMPLES=100` was tuned
+for: on pass 2 and later, every "new" episode is data the learner has already
+seen. The knob that fixes the cost without shortening DIMA's per-round schedule
+is therefore the trigger rate, not the epoch counts:
+
+```bash
+python -m research.pipeline --preset server --n-samples 2000   # 1 round per 10 episodes
+```
+
+That is 800 rounds instead of 8 000, same 460 steps each. Use `--max-hours` as
+the backstop either way — the run stops cleanly, validates and writes
+`model_final.pth`, and records `stopped_early: true` in the manifest.
+
+Every preset size is still overridable (`--episodes`, `--passes`, `--horizon`,
+`--wm-epochs`, …), and `--seed` / `--tag` are what you vary to run several
+independent jobs at once — see *GPU architecture* below.
+
+**The evaluate stage is bounded by the `oracle` row, not by the GPU.**
+`OracleWorldModel` forks the real MATE environment once per camera per candidate
+action, so that row costs `episodes × steps × 4 × 25` environment steps on the
+CPU and a faster card does nothing for it. On `MATE-4v8-9` — 8 targets and 9
+obstacles to advance per fork — it is roughly two orders of magnitude more
+wall-time than any other row. That is why `server` evaluates at 10 × 150, the
+same protocol as the published baseline matrix below, and why the useful split on
+a busy machine is
+
+```bash
+python -m research.pipeline --preset server --stages collect,train --tag 4v8-s0
+python -m research.pipeline --preset server --stages evaluate     --tag 4v8-s0
+```
+
+— the second command reuses the first one's directory and checkpoint.
+
+### Three things are set up for the GPU, and one of them matters a lot
 
 ### `configure_torch` runs before any DIMA module is built
 
@@ -120,7 +283,107 @@ GPU. Three things are set up for that, and one of them matters a lot.
 
 The GPU name, compute capability, memory and the flags actually applied are
 printed as an `[WM]` line and stored in `manifest.json`. On CPU it prints a
-`[WARN]` saying the path is for testing, not for training.
+`[WARN]` saying the path is for testing, not for training, and
+`research.pipeline --preset server` repeats that warning before it collects a
+single episode — a server run that silently lands on CPU does not crash, it just
+takes weeks.
+
+DIMA also draws a tqdm bar per inner training step — several hundred per episode.
+`train_wm.py` keeps them only when stdout is a terminal, so a `nohup`'d server log
+stays readable instead of filling with carriage returns.
+
+### GPU architecture: an NVIDIA RTX card, and several jobs on it
+
+**The models are small.** On `MATE-4v8-9` at `--horizon 5`:
+
+| module | parameters |
+|---|---|
+| `Denoiser` | 14.1 M |
+| `TransRewEndModel` | 8.4 M |
+| `SimpleVQAutoEncoder` | 0.7 M |
+
+and the batch sizes are **fixed inside `DreamerLearner.step`**, not in the config:
+`bs=256, sl=1` for the state decoder (line 317), `batch_num_samples=64,
+sequence_length=6` for the denoiser (line 362), `bs=128, sl=horizon` for the
+reward/end model (line 420). Weights, gradients and Adam state together come to a
+few hundred MB; **one training process fits in about 4 GB of VRAM**
+(`research.pipeline.VRAM_PER_JOB_GB`).
+
+That is the whole basis of the hardware choice. 23 M parameters at batch 64 does
+not fill a datacentre accelerator, and it never will while the batch sizes are
+hard-coded — so the right architecture here is **one consumer RTX card**, and the
+way to use it is more processes rather than a bigger one.
+
+#### Which RTX
+
+The one hard requirement is **compute capability 8.0 or later — Ampere onwards,
+which on the RTX line means the 30-series and newer.** TF32 is an Ampere tensor-core
+format; on Turing (RTX 20, cc 7.5) and older, `configure_torch`'s
+`allow_tf32` flags are accepted and silently do nothing, and the denoiser is
+matmul-bound, so that is exactly where the free speedup lives. `configure_torch`
+now records `tf32`, `tf32_requested` and `tf32_supported` separately in the run
+manifest, and the pipeline prints a `[WARN]` on a pre-Ampere card rather than
+letting the manifest imply a speedup that never happened.
+
+| card | VRAM | cc | training jobs that fit (~4 GB each) |
+|---|---|---|---|
+| RTX 3060 12 GB / 4070 Ti | 12 GB | 8.6 / 8.9 | 3 |
+| RTX 4080 / 5080 | 16 GB | 8.9 / 12.0 | 4 |
+| **RTX 3090 / 4090 / A5000** | **24 GB** | **8.6 / 8.9** | **6** — the sweet spot |
+| RTX 5090 | 32 GB | 12.0 | 8 |
+| RTX A6000 / 6000 Ada | 48 GB | 8.6 / 8.9 | 12, if the CPU can feed them |
+| RTX 2080 Ti | 11 GB | 7.5 | runs, but **no TF32** |
+
+Read the real numbers off the `[RUN]`/`[WM]` line rather than this table — both
+`configure_torch` and the pipeline preflight print the card's name, compute
+capability and memory, and the preflight also prints how many jobs it thinks fit.
+
+A faster card in the same generation buys much less than the spec sheet suggests:
+each training step's GPU work is milliseconds, and the loop spends the rest of its
+time in Python. **What is between the steps is the cost.** Every batch is assembled
+on the main thread — `MultiAgentEpisodesDataset._sample_episodes_segments` loops
+over the 64 sampled segments in Python, `torch.stack`s them, then copies to the
+device synchronously and unpinned — so a fast **single-thread** CPU matters more
+than core count, and the GPU idles for a large fraction of every step.
+
+#### Filling the card
+
+That idle time is free capacity. Different seeds are independent runs and DIMA has
+no DDP anywhere, so scale out with processes:
+
+```bash
+# 24 GB RTX: four seeds side by side, ~16 GB, each pinned to its own CPU share
+for seed in 0 1 2 3; do
+    nohup python -m research.pipeline --preset server --seed $seed \
+        --tag 4v8-s$seed --threads 6 --max-hours 20 > pipeline-s$seed.log 2>&1 &
+done
+```
+
+Rules of thumb for that:
+
+* **`--threads` is not optional here.** PyTorch otherwise takes every core in every
+  process and they thrash. Budget roughly `cores / jobs`, and remember each job
+  also needs one fast core for batch assembly.
+* **Leave headroom.** The table's job count is VRAM arithmetic; a desktop RTX is
+  also driving a display and the allocator fragments. Four jobs on a 24 GB card is
+  comfortable, six is the ceiling.
+* **Watch the clocks, not just memory.** Consumer RTX cards are throttled by power
+  and temperature well before they are throttled by VRAM, and four concurrent jobs
+  hold the card at load indefinitely. `nvidia-smi -l 5` during the first hour tells
+  you whether the box can actually sustain it.
+* **A second card is more jobs, not faster ones.** `CUDA_VISIBLE_DEVICES=1` and
+  another batch of seeds. Nothing in DIMA's world-model path is multi-GPU, and
+  consumer RTX has no NVLink to change that.
+
+**Not done, and each would mean patching DIMA.** Mixed precision (there is no
+`autocast`/`GradScaler` anywhere in the training path, though the vendored
+`vector_quantize_pytorch` already guards its own layers with
+`@autocast(enabled=False)`) — worth the most on Ada and Blackwell, where the
+bf16 tensor cores are furthest ahead of the TF32 path; larger batches, which are
+hard-coded at the three call sites above; pinned memory with a prefetch thread to
+overlap batch assembly with compute. All three are real speedups and all three
+change upstream code, so they are recorded here rather than applied — see
+`research/UPSTREAM_PATCHES.md` for the bar a patch has to clear.
 
 ### Watch the metrics that matter, not the loss
 
@@ -206,6 +469,7 @@ of `size mismatch` lines that never mentions horizons.
 | `research/rollout.py` | the closed loop; conversion to DIMA's rollout dict |
 | `research/diagnostics.py` | prediction error, action sensitivity, ranking, planner metrics |
 | `research/logging_utils.py` | `[CATEGORY]` console + wandb + DIMA's TensorBoard + run manifest |
+| `research/pipeline.py` | collect → train → evaluate in one command; presets, run layout, resume |
 | `research/collect.py` `train_wm.py` `evaluate.py` `smoke_test.py` `mate_evaluate.py` | entry points |
 | `tests/test_research.py` | `unittest`; neither upstream ships tests |
 
