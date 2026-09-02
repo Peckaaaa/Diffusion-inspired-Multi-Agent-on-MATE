@@ -349,6 +349,7 @@ class DIMAWorldModel(WorldModel):
             allow_dima_checkpoint_globals,
             apply_checkpoint_config,
             build_learner_config,
+            resolve_weights_checkpoint,
         )
 
         allow_dima_checkpoint_globals()
@@ -366,7 +367,9 @@ class DIMAWorldModel(WorldModel):
 
         config.CAPACITY = max(2048, config.denoiser_cfg.inner_model.num_steps_conditioning + 8)
         config.load_pretrained = True
-        config.load_path = checkpoint_path
+        # Accept the resumable checkpoint as well as a plain weights one; see
+        # research/config.py.  load_pretrained only reads the flat shape.
+        config.load_path = str(resolve_weights_checkpoint(checkpoint_path))
 
         from agent.learners.DreamerLearner import DreamerLearner
 

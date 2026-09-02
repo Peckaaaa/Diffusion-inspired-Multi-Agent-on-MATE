@@ -46,7 +46,7 @@ import research  # noqa: F401 - installs sys.path + compat shims
 
 from mate import constants as consts
 from research.collect import load_dataset
-from research.config import allow_dima_checkpoint_globals
+from research.config import allow_dima_checkpoint_globals, resolve_weights_checkpoint
 from research.diagnostics import _pairwise_mean_distance
 from research.logging_utils import log
 from research.train_wm import build_env_from_manifest
@@ -64,45 +64,12 @@ MASK_THRESHOLDS = (0.1, 0.25, 0.5, 0.75, 0.9)
 
 
 def _weights_checkpoint(checkpoint: Path) -> Path:
-    """A checkpoint in the weights-only shape ``DIMAWorldModel`` can load.
+    """Kept as a thin alias so the probe reads the same checkpoints evaluation does."""
 
-    ``ckpt/latest.pth`` is the resumable checkpoint written by
-    ``DreamerLearner.save_full``: optimiser state, counters and RNG state wrapped
-    around the weights. It is the freshest state a running job has on disk and so
-    the natural thing to probe, but ``load_pretrained`` expects the flat
-    ``params()`` layout. Rather than make the caller hunt for the newest
-    ``model_ep*.pth``, the weights are extracted into a sibling file here.
-
-    A checkpoint already in the flat shape is returned unchanged.
-    """
-
-    import torch
-
-    checkpoint = Path(checkpoint)
-    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    if not isinstance(ckpt, dict) or 'learner' not in ckpt:
-        return checkpoint
-
-    state = ckpt['learner']
-    modules = state['modules']
-    rms_fields = state['state_rms']
-
-    from agent.utils.running_mean_std import RunningMeanStd
-
-    running_mean_std = RunningMeanStd(shape=np.asarray(rms_fields['mean']).shape)
-    running_mean_std.mean = np.asarray(rms_fields['mean'], dtype=np.float64)
-    running_mean_std.var = np.asarray(rms_fields['var'], dtype=np.float64)
-    running_mean_std.count = float(rms_fields['count'])
-
-    flat = {name: modules[name] for name in
-            ('state_decoder', 'denoiser', 'rew_end_model', 'actor', 'critic')
-            if name in modules}
-    flat['running_mean_std'] = running_mean_std
-
-    extracted = checkpoint.with_name(checkpoint.stem + '_weights.pth')
-    torch.save(flat, extracted)
-    log('PROBE', f'extracted weights from the resumable checkpoint -> {extracted}')
-    return extracted
+    resolved = resolve_weights_checkpoint(checkpoint)
+    if Path(resolved) != Path(checkpoint):
+        log('PROBE', f'extracted weights from the resumable checkpoint -> {resolved}')
+    return Path(resolved)
 
 
 def _summarise(name: str, error: np.ndarray, truth: np.ndarray) -> Dict[str, float]:

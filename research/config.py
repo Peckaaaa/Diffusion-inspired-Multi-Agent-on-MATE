@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 
 import research  # noqa: F401 - installs sys.path + compat shims
@@ -46,6 +47,51 @@ __all__ = [
     'CHECKPOINT_CONFIG_FIELDS',
     'CHECKPOINT_CONFIG_FILENAME',
 ]
+
+
+def resolve_weights_checkpoint(checkpoint) -> Path:
+    """A checkpoint path in the flat shape ``DreamerLearner.load_pretrained`` reads.
+
+    Two different files get called "the checkpoint" in this project.
+    ``model_*.pth`` holds ``DreamerLearner.params()`` -- a flat dict of module
+    state -- while ``ckpt/latest.pth`` is the resumable checkpoint from
+    ``save_full``, which wraps those modules together with optimiser state,
+    counters and RNG state under a ``'learner'`` key.
+
+    ``load_pretrained`` only understands the flat shape, and on PyTorch >= 2.6 it
+    does not even get that far: it calls ``torch.load`` with the new
+    ``weights_only=True`` default, which refuses the resumable file's numpy RNG
+    state outright. Since the resumable one is the freshest state a running job
+    has on disk, and therefore the natural thing to evaluate or probe, the weights
+    are extracted here into a sibling file rather than being rejected.
+
+    A checkpoint already in the flat shape is returned unchanged.
+    """
+
+    from agent.utils.running_mean_std import RunningMeanStd
+
+    checkpoint = Path(checkpoint)
+    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict) or 'learner' not in ckpt:
+        return checkpoint
+
+    state = ckpt['learner']
+    rms_fields = state['state_rms']
+    running_mean_std = RunningMeanStd(shape=np.asarray(rms_fields['mean']).shape)
+    running_mean_std.mean = np.asarray(rms_fields['mean'], dtype=np.float64)
+    running_mean_std.var = np.asarray(rms_fields['var'], dtype=np.float64)
+    running_mean_std.count = float(rms_fields['count'])
+
+    flat = {
+        name: state['modules'][name]
+        for name in ('state_decoder', 'denoiser', 'rew_end_model', 'actor', 'critic')
+        if name in state['modules']
+    }
+    flat['running_mean_std'] = running_mean_std
+
+    extracted = checkpoint.with_name(checkpoint.stem + '_weights.pth')
+    torch.save(flat, extracted)
+    return extracted
 
 
 def allow_dima_checkpoint_globals() -> None:
