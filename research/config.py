@@ -30,6 +30,7 @@ from configs.dreamer.DreamerLearnerConfig import DreamerLearnerConfig
 from environments import Env
 
 from research.env_adapter import MATEEnv
+from research.views import ObservationLayout
 
 
 __all__ = [
@@ -402,6 +403,13 @@ def build_learner_config(
     config.seed = int(seed)
     config.RUN_DIR = str(run_dir)
     config.map_name = env.scenario
+
+    # Which observation channels are 0/1 presence flags, so the state decoder can
+    # score them with a mean-seeking loss.  DIMA has no idea what MATE's
+    # observation contains, so the layout is resolved here and handed down as
+    # plain indices.  See MATEDreamerLearnerConfig.obs_binary_indices.
+    layout = ObservationLayout.from_env_metadata(env.metadata())
+    config.obs_binary_indices = layout.joint_binary_channel_indices(config.NUM_AGENTS).tolist()
 
     for key, value in (overrides or {}).items():
         if not hasattr(config, key):

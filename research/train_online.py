@@ -52,6 +52,7 @@ from research.logging_utils import (
     resolve_resume,
 )
 from research.planners import DIMAActorPlanner, build_planner
+from research.train_wm import minimum_buffer_steps
 from research.rollout import run_episode, to_dima_rollout
 from research.validation import ValidationEpisode, format_trend, validate
 from research.views import ObservationLayout
@@ -83,6 +84,9 @@ def train(
     state_decoder_batch_size: Optional[int] = None,
     denoiser_batch_size: Optional[int] = None,
     rew_end_batch_size: Optional[int] = None,
+    obs_binary_loss_weight: Optional[float] = None,
+    nums_obs_token: Optional[int] = None,
+    obs_vocab_size: Optional[int] = None,
     save_every: int = 25,
     val_episodes: int = 20,
     eval_every: int = 50,
@@ -122,6 +126,12 @@ def train(
         overrides['denoiser_batch_size'] = int(denoiser_batch_size)
     if rew_end_batch_size is not None:
         overrides['rew_end_batch_size'] = int(rew_end_batch_size)
+    if obs_binary_loss_weight is not None:
+        overrides['obs_binary_loss_weight'] = float(obs_binary_loss_weight)
+    if nums_obs_token is not None:
+        overrides['nums_obs_token'] = int(nums_obs_token)
+    if obs_vocab_size is not None:
+        overrides['OBS_VOCAB_SIZE'] = int(obs_vocab_size)
 
     config = build_learner_config(
         env,
@@ -137,6 +147,23 @@ def train(
         train_actor_critic=True,
         overrides=overrides,
     )
+    # DreamerMemory.sample_indices needs batch_size * sequence_length steps, which
+    # for a raised rew_end_batch_size can exceed MIN_BUFFER_SIZE.  Warmup ends on
+    # MIN_BUFFER_SIZE, so without this the first training round raises
+    # 'Not enough data in buffer' and kills the run.  train_wm.py:207 does the same.
+    required = minimum_buffer_steps(
+        config.horizon,
+        state_decoder_batch_size=config.state_decoder_batch_size,
+        rew_end_batch_size=config.rew_end_batch_size,
+    )
+    if config.MIN_BUFFER_SIZE < required:
+        log(
+            'WARN',
+            f'MIN_BUFFER_SIZE={config.MIN_BUFFER_SIZE} is below the {required} steps '
+            f'DreamerLearner.step needs at horizon={config.horizon}; raising it to {required}.',
+        )
+        config.MIN_BUFFER_SIZE = required
+
     allow_dima_checkpoint_globals()
     torch_setup = configure_torch(
         config.DEVICE, detect_anomaly=detect_anomaly, threads=threads, seed=seed
@@ -455,6 +482,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help='stop after this many episodes; omit to run until stopped')
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
+    parser.add_argument('--obs-binary-loss-weight', type=float, default=None,
+                        help='weight on the 0/1 flag block of the state decoder loss '
+                             '(default 1.0)')
+    parser.add_argument('--nums-obs-token', type=int, default=None,
+                        help='VQ tokens the state is compressed into (default 12)')
+    parser.add_argument('--obs-vocab-size', type=int, default=None,
+                        help='VQ codebook size (default 128)')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -483,6 +517,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         state_decoder_batch_size=args.state_decoder_batch_size,
         denoiser_batch_size=args.denoiser_batch_size,
         rew_end_batch_size=args.rew_end_batch_size,
+        obs_binary_loss_weight=args.obs_binary_loss_weight,
+        nums_obs_token=args.nums_obs_token,
+        obs_vocab_size=args.obs_vocab_size,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
         eval_every=args.eval_every,

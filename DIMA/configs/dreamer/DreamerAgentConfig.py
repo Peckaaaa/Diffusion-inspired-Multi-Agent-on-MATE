@@ -58,6 +58,24 @@ class DreamerConfig(Config):
         self.OBS_VOCAB_SIZE = 128
         self.ema_decay = 0.8
         self.alpha = 10.
+
+        # Indices, into the flattened joint observation the state decoder
+        # reconstructs, of channels that are 0/1 flags rather than continuous
+        # values.  The reconstruction loss is L1, whose optimum is the conditional
+        # *median*: for a flag that is 1 only a minority of the time the median is
+        # 0, so L1 pins those channels at 0 and they carry no information about
+        # how likely the flag is.  Scoring them with a squared error instead puts
+        # the optimum at the conditional mean, which is the probability itself.
+        #
+        # Left as None for environments that do not name any such channel, in
+        # which case the loss is unchanged.  MATE fills it in via
+        # research/config.py.
+        self.obs_binary_indices = None
+        # Weight on that block, relative to the continuous one.  The flags are a
+        # small fraction of the observation, so a decoder short of capacity is
+        # right to spend it elsewhere; raising this buys flag accuracy with
+        # continuous accuracy.
+        self.obs_binary_loss_weight = 1.0
         self.vq_type = 'vq' # 'fsq', 'vq'
 
         self.policy_class = 'discrete'

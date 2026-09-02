@@ -148,6 +148,9 @@ def train(
     state_decoder_batch_size: Optional[int] = None,
     denoiser_batch_size: Optional[int] = None,
     rew_end_batch_size: Optional[int] = None,
+    obs_binary_loss_weight: Optional[float] = None,
+    nums_obs_token: Optional[int] = None,
+    obs_vocab_size: Optional[int] = None,
     train_actor_critic: bool = False,
     save_every: int = 1,
     val_episodes: int = 20,
@@ -189,6 +192,12 @@ def train(
         overrides['denoiser_batch_size'] = int(denoiser_batch_size)
     if rew_end_batch_size is not None:
         overrides['rew_end_batch_size'] = int(rew_end_batch_size)
+    if obs_binary_loss_weight is not None:
+        overrides['obs_binary_loss_weight'] = float(obs_binary_loss_weight)
+    if nums_obs_token is not None:
+        overrides['nums_obs_token'] = int(nums_obs_token)
+    if obs_vocab_size is not None:
+        overrides['OBS_VOCAB_SIZE'] = int(obs_vocab_size)
 
     config = build_learner_config(
         env,
@@ -543,6 +552,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help='stop cleanly and save before this wall-clock budget runs out')
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
+    parser.add_argument('--obs-binary-loss-weight', type=float, default=None,
+                        help='weight on the 0/1 flag block of the state decoder loss '
+                             '(default 1.0; raise to buy flag accuracy with continuous accuracy)')
+    parser.add_argument('--nums-obs-token', type=int, default=None,
+                        help='VQ tokens the state is compressed into (default 12)')
+    parser.add_argument('--obs-vocab-size', type=int, default=None,
+                        help='VQ codebook size (default 128); the decoder bottleneck is '
+                             'nums_obs_token * log2(obs_vocab_size) bits')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: pass the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -569,6 +586,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         state_decoder_batch_size=args.state_decoder_batch_size,
         denoiser_batch_size=args.denoiser_batch_size,
         rew_end_batch_size=args.rew_end_batch_size,
+        obs_binary_loss_weight=args.obs_binary_loss_weight,
+        nums_obs_token=args.nums_obs_token,
+        obs_vocab_size=args.obs_vocab_size,
         train_actor_critic=args.train_actor_critic,
         save_every=args.save_every,
         val_episodes=args.val_episodes,

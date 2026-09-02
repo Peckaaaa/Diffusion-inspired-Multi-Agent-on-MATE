@@ -55,6 +55,32 @@ class ObservationLayout:
             )[-1]
         )
 
+    @property
+    def binary_channel_indices(self) -> np.ndarray:
+        """Indices, within one camera observation, of the 0/1 presence flags.
+
+        MATE marks each opponent, obstacle and teammate entry with a mask channel
+        that is exactly 0 or 1; the rest of the observation is continuous. They
+        are the only discrete channels, and the only ones a mean-seeking loss
+        turns into a usable probability, so they are named here rather than
+        rediscovered by whoever needs them.
+        """
+
+        return np.concatenate([
+            np.arange(self.obs_dim)[self.slices[name]]
+            for name in ('opponent_mask', 'obstacle_mask', 'teammate_mask')
+        ])
+
+    def joint_binary_channel_indices(self, num_agents: int) -> np.ndarray:
+        """The same indices into a joint observation flattened as ``(n * obs_dim)``.
+
+        That is the layout the state decoder is trained against
+        (``DreamerLearner.train_vq_tokenizer`` flattens ``b t n d -> b t (n d)``).
+        """
+
+        per_camera = self.binary_channel_indices
+        return np.concatenate([per_camera + a * self.obs_dim for a in range(int(num_agents))])
+
     @classmethod
     def from_env_metadata(cls, metadata: Dict) -> 'ObservationLayout':
         return cls(

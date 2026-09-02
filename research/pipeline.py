@@ -88,6 +88,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         wm_epochs=4,
         denoiser_steps_first_epoch=4,
         remodel_steps=4,
+        obs_binary_loss_weight=None,
+        nums_obs_token=None,
+        obs_vocab_size=None,
         sensitivity_samples=2,
         # DIMA's original batch sizes: the raised defaults would demand a bigger
         # replay buffer than this preset ever collects.
@@ -114,6 +117,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         state_decoder_batch_size=None,
         denoiser_batch_size=None,
         rew_end_batch_size=None,
+        obs_binary_loss_weight=None,
+        nums_obs_token=None,
+        obs_vocab_size=None,
         sensitivity_samples=4,
         eval_episodes=10,
         eval_max_episode_steps=150,
@@ -134,6 +140,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         state_decoder_batch_size=None,
         denoiser_batch_size=None,
         rew_end_batch_size=None,
+        obs_binary_loss_weight=None,
+        nums_obs_token=None,
+        obs_vocab_size=None,
         sensitivity_samples=8,
         # 10 x 150 is the protocol the README's published baseline matrix used, so
         # a server run stays comparable to it.  It is also as much as the `oracle`
@@ -161,6 +170,9 @@ _OVERRIDE_FIELDS = (
     'state_decoder_batch_size',
     'denoiser_batch_size',
     'rew_end_batch_size',
+    'obs_binary_loss_weight',
+    'nums_obs_token',
+    'obs_vocab_size',
     'sensitivity_samples',
     'eval_episodes',
     'eval_max_episode_steps',
@@ -465,6 +477,9 @@ def run_pipeline(
                 state_decoder_batch_size=size['state_decoder_batch_size'],
                 denoiser_batch_size=size['denoiser_batch_size'],
                 rew_end_batch_size=size['rew_end_batch_size'],
+                obs_binary_loss_weight=size['obs_binary_loss_weight'],
+                nums_obs_token=size['nums_obs_token'],
+                obs_vocab_size=size['obs_vocab_size'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -499,6 +514,9 @@ def run_pipeline(
                 state_decoder_batch_size=size['state_decoder_batch_size'],
                 denoiser_batch_size=size['denoiser_batch_size'],
                 rew_end_batch_size=size['rew_end_batch_size'],
+                obs_binary_loss_weight=size['obs_binary_loss_weight'],
+                nums_obs_token=size['nums_obs_token'],
+                obs_vocab_size=size['obs_vocab_size'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -603,6 +621,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     sizes.add_argument('--state-decoder-batch-size', type=int, default=None)
     sizes.add_argument('--denoiser-batch-size', type=int, default=None)
     sizes.add_argument('--rew-end-batch-size', type=int, default=None)
+    sizes.add_argument('--obs-binary-loss-weight', type=float, default=None,
+                       help='weight on the 0/1 flag block of the state decoder loss (default 1.0)')
+    sizes.add_argument('--nums-obs-token', type=int, default=None,
+                       help='VQ tokens the state is compressed into (default 12)')
+    sizes.add_argument('--obs-vocab-size', type=int, default=None,
+                       help='VQ codebook size (default 128)')
     sizes.add_argument('--sensitivity-samples', type=int, default=None)
     sizes.add_argument('--eval-episodes', type=int, default=None)
     sizes.add_argument('--eval-max-episode-steps', type=int, default=None)

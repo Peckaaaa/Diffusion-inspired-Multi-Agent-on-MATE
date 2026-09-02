@@ -202,6 +202,9 @@ class DreamerLearner:
         print(f"{count_parameters(self.critic)} parameters in critic")
         print("")
 
+        self._binary_index_tensor = None
+        self._continuous_index_tensor = None
+
         self.train_ac_only = False
         self.evaluate = False
         if config.load_pretrained:
@@ -600,6 +603,47 @@ class DreamerLearner:
         self.cur_wandb_epoch += 1
 
     #### train state decoder
+    def _reconstruction_loss(self, out, obs):
+        """Reconstruction loss for the state decoder.
+
+        L1 everywhere, except on the channels ``config.obs_binary_indices`` names
+        as 0/1 flags: those get a squared error. L1's optimum is the conditional
+        median, which for a flag that is rarely 1 is exactly 0 -- the decoder then
+        predicts "never" for every flag and the prediction says nothing about how
+        likely it is. A squared error puts the optimum at the conditional mean,
+        which for a 0/1 variable *is* the probability, and so is directly
+        comparable against the 0.5 cut a reader applies to it.
+
+        Returns the total loss and its two parts, so a run can be watched for the
+        flag block improving while the continuous block holds.
+        """
+
+        binary_indices = getattr(self.config, 'obs_binary_indices', None)
+        if not binary_indices:
+            rec_loss = (out - obs).abs().mean()
+            return rec_loss, rec_loss, None
+
+        if self._binary_index_tensor is None or self._binary_index_tensor.device != out.device:
+            self._binary_index_tensor = torch.as_tensor(
+                binary_indices, dtype=torch.long, device=out.device
+            )
+            mask = torch.zeros(out.shape[-1], dtype=torch.bool, device=out.device)
+            mask[self._binary_index_tensor] = True
+            self._continuous_index_tensor = torch.nonzero(~mask, as_tuple=False).squeeze(-1)
+
+        binary_loss = (
+            (out[..., self._binary_index_tensor] - obs[..., self._binary_index_tensor])
+            .square()
+            .mean()
+        )
+        continuous_loss = (
+            (out[..., self._continuous_index_tensor] - obs[..., self._continuous_index_tensor])
+            .abs()
+            .mean()
+        )
+        weight = float(getattr(self.config, 'obs_binary_loss_weight', 1.0))
+        return continuous_loss + weight * binary_loss, continuous_loss, binary_loss
+
     def train_vq_tokenizer(self, state, obs):
         assert type(self.state_decoder) == SimpleVQAutoEncoder
 
@@ -624,7 +668,7 @@ class DreamerLearner:
 
 
         out, indices, cmt_loss = self.state_decoder(state, True, True)      # tokenzier 内部的预处理
-        rec_loss = (out - obs).abs().mean()
+        rec_loss, continuous_loss, binary_loss = self._reconstruction_loss(out, obs)
         loss = rec_loss + self.config.alpha * cmt_loss
 
         active_rate = indices.detach().unique().numel() / self.obs_vocab_size * 100
@@ -637,6 +681,9 @@ class DreamerLearner:
             self.config.vq_type + "/rec_loss": rec_loss.item(),
             self.config.vq_type + "/active": active_rate,
         }
+        if binary_loss is not None:
+            loss_dict[self.config.vq_type + "/rec_loss_continuous"] = continuous_loss.item()
+            loss_dict[self.config.vq_type + "/rec_loss_binary"] = binary_loss.item()
 
         return loss_dict
 
@@ -663,7 +710,7 @@ class DreamerLearner:
         #     obs_target = obs[:, 1:].clone()
 
         out, indices = self.state_decoder(state, True, True)
-        loss = (out - obs).abs().mean()
+        loss, continuous_loss, binary_loss = self._reconstruction_loss(out, obs)
 
         active_rate = indices.detach().unique().numel() / self.obs_vocab_size * 100
 
@@ -674,6 +721,9 @@ class DreamerLearner:
             self.config.vq_type + "/rec_loss": loss.item(),
             self.config.vq_type + "/active": active_rate,
         }
+        if binary_loss is not None:
+            loss_dict[self.config.vq_type + "/rec_loss_continuous"] = continuous_loss.item()
+            loss_dict[self.config.vq_type + "/rec_loss_binary"] = binary_loss.item()
 
         return loss_dict
 
