@@ -47,6 +47,7 @@ import research  # noqa: F401 - installs sys.path + compat shims
 from mate import constants as consts
 from research.collect import load_dataset
 from research.config import allow_dima_checkpoint_globals
+from research.diagnostics import _pairwise_mean_distance
 from research.logging_utils import log
 from research.train_wm import build_env_from_manifest
 from research.validation import ValidationEpisode, _history_at
@@ -190,6 +191,115 @@ def _decoder_reconstruction(model, episodes, layout, rng, count: int) -> Dict[st
         },
         'camera_pos_mae': float(np.abs(camera_err).mean()),
         'camera_pos_truth_std': float(truth_world[:, :, self_state][..., 0:2].std()),
+    }
+
+
+def _seeded_predict(model, history, action, seed: int) -> np.ndarray:
+    """One prediction with the diffusion noise pinned to ``seed``.
+
+    ``sensitivity_ratio`` compares actions through 8-sample means, so anything
+    smaller than the sampling error of those means -- 1/sqrt(8) of the noise --
+    is invisible to it. Pinning the seed removes the noise from the comparison
+    entirely: two predictions that differ only in the action see identical noise,
+    so whatever separates them is the action's doing, however small.
+    """
+
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return np.asarray(
+        model.predict(history, np.asarray(action), horizon=1).states[0, 0], dtype=np.float64
+    )
+
+
+def action_effect(
+    model,
+    episodes,
+    rng,
+    *,
+    num_agents: int,
+    num_actions: int,
+    states: int = 20,
+    candidates: int = 6,
+    noise_seeds: int = 6,
+) -> Dict[str, object]:
+    """How much the action moves the predicted next state, noise held fixed.
+
+    Three quantities per sampled state:
+
+    ``effect``       spread of predictions across candidate actions for one camera,
+                     all sharing one noise seed
+    ``noise``        spread across noise seeds for one fixed action -- the scale
+                     ``effect`` has to be read against
+    ``extreme``      distance between the two most different joint actions
+                     (all-zero vs all-max), same seed: the largest effect the
+                     model can show at this state
+
+    ``identical_pairs`` counts candidate pairs whose predictions match to
+    floating-point exactness. A model that merely learned to ignore the action
+    still produces slightly different numbers; bitwise-identical output means the
+    action never reached the network at all, which is a wiring bug rather than a
+    training outcome.
+    """
+
+    conditioning = model.conditioning_steps
+    usable = [e for e in episodes if len(e.transitions) > conditioning + 1]
+
+    effects, noises, extremes = [], [], []
+    identical_pairs = 0
+    compared_pairs = 0
+
+    action_grid = np.linspace(0, num_actions - 1, candidates).astype(np.int64)
+
+    for i in range(states):
+        episode = usable[int(rng.integers(len(usable)))]
+        t = int(rng.integers(conditioning - 1, len(episode.transitions) - 1))
+        history = _history_at(episode, t, conditioning)
+        base = np.asarray(episode.transitions[t].action, dtype=np.int64).reshape(-1)
+        seed = 10_000 + i
+
+        # Vary camera 0 only, everything else pinned.
+        preds = []
+        for a in action_grid:
+            joint = base.copy()
+            joint[0] = a
+            preds.append(_seeded_predict(model, history, joint, seed))
+        preds = np.stack(preds)
+        effects.append(_pairwise_mean_distance(preds))
+
+        for x in range(len(preds)):
+            for y in range(x + 1, len(preds)):
+                compared_pairs += 1
+                if np.array_equal(preds[x], preds[y]):
+                    identical_pairs += 1
+
+        # Same action, different noise: the scale to read `effect` against.
+        noise_preds = np.stack(
+            [_seeded_predict(model, history, base, seed + 1000 * k) for k in range(noise_seeds)]
+        )
+        noises.append(_pairwise_mean_distance(noise_preds))
+
+        # The two furthest-apart joint actions, noise held fixed.
+        low = _seeded_predict(model, history, np.zeros(num_agents, dtype=np.int64), seed)
+        high = _seeded_predict(
+            model, history, np.full(num_agents, num_actions - 1, dtype=np.int64), seed
+        )
+        extremes.append(float(np.linalg.norm(high - low)))
+
+    effect = float(np.mean(effects))
+    noise = float(np.mean(noises))
+    return {
+        'states': states,
+        'candidates': int(action_grid.size),
+        'effect': effect,
+        'noise': noise,
+        'effect_over_noise': effect / noise if noise else float('inf'),
+        'extreme_effect': float(np.mean(extremes)),
+        'extreme_over_noise': float(np.mean(extremes)) / noise if noise else float('inf'),
+        'identical_pairs': identical_pairs,
+        'compared_pairs': compared_pairs,
     }
 
 
@@ -485,12 +595,60 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--num-samples', type=int, default=1,
                         help='diffusion samples averaged per prediction')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--action-effect', action='store_true',
+                        help='measure how much the action moves the predicted state with the '
+                             'diffusion noise pinned, instead of the full reconstruction probe')
+    parser.add_argument('--states', type=int, default=20,
+                        help='action-effect only: states sampled')
     parser.add_argument('--out', type=Path, default=None, help='write the report as JSON')
     return parser.parse_args(argv)
 
 
+def _run_action_effect(args) -> Dict[str, object]:
+    manifest, rollouts = load_dataset(args.dataset)
+    env = build_env_from_manifest(manifest, seed=args.seed)
+    allow_dima_checkpoint_globals()
+    model = DIMAWorldModel(
+        env, _weights_checkpoint(args.checkpoint), device=args.device, num_samples=1
+    )
+    episodes = [ValidationEpisode.from_rollout(r, env) for r in rollouts]
+    report = action_effect(
+        model,
+        episodes,
+        np.random.default_rng(args.seed),
+        num_agents=env.n_agents,
+        num_actions=env.n_actions,
+        states=args.states,
+    )
+    report['checkpoint'] = str(args.checkpoint)
+
+    log('PROBE', f'checkpoint {args.checkpoint}')
+    log('PROBE', f'{report["states"]} states x {report["candidates"]} candidate actions, '
+                 f'diffusion noise pinned per state')
+    log('PROBE', f'  action effect (vary camera 0)   {report["effect"]:.4f}')
+    log('PROBE', f'  noise floor   (vary seed)       {report["noise"]:.4f}')
+    log('PROBE', f'  effect / noise                  {report["effect_over_noise"]:.4f}')
+    log('PROBE', f'  extreme action pair             {report["extreme_effect"]:.4f} '
+                 f'({report["extreme_over_noise"]:.4f} x noise)')
+    log('PROBE', f'  bitwise-identical pairs         {report["identical_pairs"]}'
+                 f'/{report["compared_pairs"]}')
+    log('PROBE', '--- reading this ---')
+    log('PROBE', '  identical pairs > 0        -> the action never reaches the network: a wiring '
+                 'bug, not a training outcome')
+    log('PROBE', '  effect/noise ~0 but not 0  -> the action reaches it and the model ignores it')
+    log('PROBE', '  effect/noise rising across checkpoints -> it is learning, just slowly')
+    env.close()
+    return report
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.action_effect:
+        report = _run_action_effect(args)
+        if args.out:
+            args.out.write_text(json.dumps(report, indent=2, default=str), encoding='utf-8')
+            log('PROBE', f'report -> {args.out}')
+        return 0
     report = probe(
         args.checkpoint,
         args.dataset,
