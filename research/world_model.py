@@ -604,7 +604,21 @@ class DIMAWorldModel(WorldModel):
                 cont_out[:, h] = cont
 
             # DiffusionSampler.sample returns the next state in latent scale.
-            next_latent, _ = self.sampler.sample(state_buffer, act_buffer)
+            # Common random numbers across the candidate actions.  Sampling is a
+            # deterministic ODE from the initial draw, so giving every candidate
+            # its own draw makes the differences between them mostly that draw:
+            # measured on a trained MATE checkpoint, changing the action moved the
+            # predicted state by 0.087 while changing the draw moved it by 3.99.
+            # One shared draw per sample index leaves the action as the only thing
+            # that differs between candidates, while candidates still get
+            # `samples` distinct futures for the uncertainty estimate.
+            base_noise = (
+                torch.randn(samples, 1, state_buffer.shape[-1], device=self.device)
+                * self.sampler.sigmas[0]
+            )
+            next_latent, _ = self.sampler.sample(
+                state_buffer, act_buffer, x0=base_noise.repeat(batch, 1, 1)
+            )
             next_state = self.sampler.decode(next_latent.squeeze(1))  # (total, state_dim)
 
             flat_obs = self.state_decoder.encode_decode(next_state)

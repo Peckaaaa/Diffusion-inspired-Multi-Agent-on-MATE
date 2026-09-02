@@ -248,6 +248,7 @@ def action_effect(
     usable = [e for e in episodes if len(e.transitions) > conditioning + 1]
 
     effects, noises, extremes = [], [], []
+    per_camera: List[List[float]] = []
     identical_pairs = 0
     compared_pairs = 0
 
@@ -260,20 +261,29 @@ def action_effect(
         base = np.asarray(episode.transitions[t].action, dtype=np.int64).reshape(-1)
         seed = 10_000 + i
 
-        # Vary camera 0 only, everything else pinned.
-        preds = []
-        for a in action_grid:
-            joint = base.copy()
-            joint[0] = a
-            preds.append(_seeded_predict(model, history, joint, seed))
-        preds = np.stack(preds)
-        effects.append(_pairwise_mean_distance(preds))
+        # One camera at a time, everything else pinned.  Which camera matters:
+        # sample_agent_order reverses the agent index, so camera n-1 conditions the
+        # first denoising step (highest sigma, coarse structure) and camera 0 the
+        # last (lowest sigma, final refinement).  Measuring only one of them would
+        # not say how much the action moves the prediction in general.
+        per_camera_now = []
+        for camera in range(num_agents):
+            preds = []
+            for a in action_grid:
+                joint = base.copy()
+                joint[camera] = a
+                preds.append(_seeded_predict(model, history, joint, seed))
+            preds = np.stack(preds)
+            per_camera_now.append(_pairwise_mean_distance(preds))
 
-        for x in range(len(preds)):
-            for y in range(x + 1, len(preds)):
-                compared_pairs += 1
-                if np.array_equal(preds[x], preds[y]):
-                    identical_pairs += 1
+            for x in range(len(preds)):
+                for y in range(x + 1, len(preds)):
+                    compared_pairs += 1
+                    if np.array_equal(preds[x], preds[y]):
+                        identical_pairs += 1
+
+        per_camera.append(per_camera_now)
+        effects.append(float(np.mean(per_camera_now)))
 
         # Same action, different noise: the scale to read `effect` against.
         noise_preds = np.stack(
@@ -292,12 +302,18 @@ def action_effect(
     noise = float(np.mean(noises))
     return {
         'states': states,
+        'num_agents': int(num_agents),
         'candidates': int(action_grid.size),
         'effect': effect,
         'noise': noise,
         'effect_over_noise': effect / noise if noise else float('inf'),
         'extreme_effect': float(np.mean(extremes)),
         'extreme_over_noise': float(np.mean(extremes)) / noise if noise else float('inf'),
+        'per_camera_effect': np.asarray(per_camera, dtype=float).mean(axis=0).tolist(),
+        'per_camera_over_noise': (
+            (np.asarray(per_camera, dtype=float).mean(axis=0) / noise).tolist()
+            if noise else None
+        ),
         'identical_pairs': identical_pairs,
         'compared_pairs': compared_pairs,
     }
@@ -625,7 +641,12 @@ def _run_action_effect(args) -> Dict[str, object]:
     log('PROBE', f'checkpoint {args.checkpoint}')
     log('PROBE', f'{report["states"]} states x {report["candidates"]} candidate actions, '
                  f'diffusion noise pinned per state')
-    log('PROBE', f'  action effect (vary camera 0)   {report["effect"]:.4f}')
+    log('PROBE', f'  action effect (mean over cameras) {report["effect"]:.4f}')
+    for cam, (eff, ratio) in enumerate(
+        zip(report['per_camera_effect'], report['per_camera_over_noise'] or [])
+    ):
+        log('PROBE', f'    camera {cam} (denoising step {report["num_agents"] - 1 - cam}) '
+                     f'effect {eff:.4f}  = {ratio:.4f} x noise')
     log('PROBE', f'  noise floor   (vary seed)       {report["noise"]:.4f}')
     log('PROBE', f'  effect / noise                  {report["effect_over_noise"]:.4f}')
     log('PROBE', f'  extreme action pair             {report["extreme_effect"]:.4f} '

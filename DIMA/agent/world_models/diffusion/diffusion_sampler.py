@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from einops import repeat
 
 import torch
@@ -61,7 +61,19 @@ class DiffusionSampler:
         return agent_order
 
     @torch.no_grad()
-    def sample(self, prev_state: Tensor, prev_act: Tensor) -> Tuple[Tensor, List[Tensor]]:
+    def sample(self, prev_state: Tensor, prev_act: Tensor, x0: Optional[Tensor] = None) -> Tuple[Tensor, List[Tensor]]:
+        """Denoise one transition.
+
+        ``x0`` overrides the initial draw from the prior.  Sampling here is a
+        deterministic probability-flow ODE -- ``s_churn`` is 0, so no noise is
+        injected after the start -- which makes the whole trajectory a function of
+        that draw (see the paper's Section 2.2: "the stochasticity only comes from
+        the initial sample").  Passing the same ``x0`` for several candidate
+        actions therefore compares them under one realisation of the environment's
+        randomness instead of one each, which is what a planner needs; leave it
+        None to draw independently, which is what imagined rollouts need.
+        """
+
         device = prev_state.device
         if prev_state.ndim == 4:   # (b, seq_length, num_agents, state_dim)
             prev_state = prev_state.mean(dim=2)
@@ -73,7 +85,11 @@ class DiffusionSampler:
         # prev_state = prev_state.reshape(b, t * c, h, w)
         s_in = torch.ones(b, device=device)
         gamma_ = min(self.cfg.s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) # TODO: 意义还没搞清楚
-        x = torch.randn(b, 1, d, device=device) * self.sigmas[0]
+        if x0 is None:
+            x = torch.randn(b, 1, d, device=device) * self.sigmas[0]
+        else:
+            assert x0.shape == (b, 1, d), f'x0 must be {(b, 1, d)}, got {tuple(x0.shape)}'
+            x = x0.to(device=device, dtype=prev_state.dtype)
         trajectory = [x]
 
         # implement sequential causal graph
