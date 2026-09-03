@@ -258,7 +258,9 @@ def train(
             'ONLINE',
             f'sampler: num_steps_denoising={config.diffusion_sampler_cfg.num_steps_denoising} '
             f'agent_order={config.diffusion_sampler_cfg.agent_order!r} '
-            f'binary_loss_weight={config.obs_binary_loss_weight}',
+            f'binary_loss_weight={config.obs_binary_loss_weight} '
+            f'imagined_reward={config.imagined_reward!r} '
+            f'entropy={config.ENTROPY}',
         )
 
         checkpoint = run_dir / 'ckpt' / 'model_final.pth'

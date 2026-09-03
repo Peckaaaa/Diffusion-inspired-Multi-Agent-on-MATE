@@ -771,7 +771,15 @@ class DreamerLearner:
             self.config.imagined_coverage_indices, dtype=torch.long, device=obs.device
         )
         sighted = obs.index_select(-1, indices) > 0.5      # (b, h, agents, targets)
-        return sighted.any(dim=-2).to(obs.dtype).mean(dim=-1)
+        coverage = sighted.any(dim=-2).to(obs.dtype).mean(dim=-1)   # (b, h)
+
+        # The rollout stores obs[:, n] as the observation the policy *acted on*, so
+        # coverage(obs[:, n]) does not depend on action n at all -- it is already
+        # settled before the action is taken.  The reward for acting at step n is
+        # the coverage of where that action leads, so the series is shifted by one.
+        # The final step has no successor inside the horizon and keeps its own
+        # value, which biases one step out of `horizon` rather than losing it.
+        return torch.cat([coverage[:, 1:], coverage[:, -1:]], dim=1)
 
     def train_agent(self, ):
         log_metrics = {}
