@@ -755,6 +755,24 @@ class DreamerLearner:
         sample = self._to_device(sample)
         self.model.visualize_attn(sample, self.tokenizer, save_path)
     
+    def imagined_coverage(self, obs):
+        """Fraction of opponents at least one agent observes, per imagined step.
+
+        ``obs`` is ``(batch, horizon, agents, obs_dim)`` in the model's own
+        observation scale.  The presence flags are 0/1 in that scale as well --
+        the environment does not rescale them -- so they can be read directly and
+        the whole thing stays one gather and two reductions, which matters because
+        this runs on every actor-critic update.
+
+        Returns ``(batch, horizon)`` in ``[0, 1]``.
+        """
+
+        indices = torch.as_tensor(
+            self.config.imagined_coverage_indices, dtype=torch.long, device=obs.device
+        )
+        sighted = obs.index_select(-1, indices) > 0.5      # (b, h, agents, targets)
+        return sighted.any(dim=-2).to(obs.dtype).mean(dim=-1)
+
     def train_agent(self, ):
         log_metrics = {}
 
@@ -770,6 +788,19 @@ class DreamerLearner:
                                              self.actor, self.critic, self.config, env_type=self.env_type)
 
         # obs, shared_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, av_actions, _ = self.wm_env_loop.send(self.config.horizon)
+
+        if self.config.imagined_reward == 'coverage':
+            if self.config.imagined_coverage_indices is None:
+                raise ValueError(
+                    "imagined_reward='coverage' needs imagined_coverage_indices; the "
+                    'research layer sets them from the environment observation layout.'
+                )
+            if self.config.use_stack:
+                raise NotImplementedError(
+                    'imagined_reward=coverage reads one observation per step, but '
+                    'use_stack concatenates several into each.'
+                )
+            rew = self.imagined_coverage(obs).reshape(rew.shape).to(rew.dtype)
 
         if self.use_valuenorm:
             val_shape = val_bootstrap.shape

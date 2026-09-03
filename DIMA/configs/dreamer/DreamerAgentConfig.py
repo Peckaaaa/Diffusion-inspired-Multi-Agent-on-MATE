@@ -76,6 +76,25 @@ class DreamerConfig(Config):
         # right to spend it elsewhere; raising this buys flag accuracy with
         # continuous accuracy.
         self.obs_binary_loss_weight = 1.0
+
+        # What the actor's lambda-return is built from.
+        #
+        # 'model' uses the learned reward head, which is what DIMA does.  On MATE
+        # that head is trained on a team reward that is zero on most steps, and
+        # measured on a trained checkpoint it moves by 1.0% of its state-to-state
+        # spread when the action changes -- too little to tell the actor which
+        # action was better.  research/planners.py reached the same conclusion for
+        # planning and scores candidates by coverage instead; this makes the same
+        # choice available to behaviour learning.
+        #
+        # 'coverage' reads the fraction of opponents at least one agent observes
+        # directly out of the imagined observation, using the mask channels named
+        # by imagined_coverage_indices.  It is dense, bounded in [0, 1], and
+        # depends on the action through the imagined state.
+        self.imagined_reward = 'model'
+        # Indices, within a single agent's observation, of the per-opponent
+        # presence flags.  Environment-specific, so the research layer fills it in.
+        self.imagined_coverage_indices = None
         self.vq_type = 'vq' # 'fsq', 'vq'
 
         self.policy_class = 'discrete'

@@ -111,6 +111,7 @@ def train(
     num_steps_denoising: Optional[int] = None,
     agent_order: Optional[str] = None,
     entropy: Optional[float] = None,
+    imagined_reward: Optional[str] = None,
     save_every: int = 25,
     val_episodes: int = 20,
     eval_every: int = 50,
@@ -162,6 +163,8 @@ def train(
         overrides['agent_order'] = str(agent_order)
     if entropy is not None:
         overrides['ENTROPY'] = float(entropy)
+    if imagined_reward is not None:
+        overrides['imagined_reward'] = str(imagined_reward)
 
     config = build_learner_config(
         env,
@@ -540,6 +543,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--entropy', type=float, default=None,
                         help="actor entropy coefficient (DIMA's default 0.001 comes from SMAC; a "
                              '25-action discrete policy collapses to one action at that value)')
+    parser.add_argument('--imagined-reward', default=None, choices=['model', 'coverage'],
+                        help="what the actor's lambda-return is built from: 'model' is DIMA's "
+                             "learned reward head, 'coverage' is the fraction of opponents the "
+                             'imagined observation shows as seen (dense, and action-dependent)')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -574,6 +581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_steps_denoising=args.num_steps_denoising,
         agent_order=args.agent_order,
         entropy=args.entropy,
+        imagined_reward=args.imagined_reward,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
         eval_every=args.eval_every,

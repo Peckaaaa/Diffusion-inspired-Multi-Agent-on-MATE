@@ -481,6 +481,9 @@ def build_learner_config(
     # plain indices.  See MATEDreamerLearnerConfig.obs_binary_indices.
     layout = ObservationLayout.from_env_metadata(env.metadata())
     config.obs_binary_indices = layout.joint_binary_channel_indices(config.NUM_AGENTS).tolist()
+    # Per-agent, not flattened: DreamerLearner reads the imagined observation as
+    # (batch, horizon, agents, obs_dim) and needs the same channels from each.
+    config.imagined_coverage_indices = layout.opponent_mask_indices.tolist()
 
     for key, value in (overrides or {}).items():
         if not hasattr(config, key):

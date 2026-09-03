@@ -77,6 +77,17 @@ class ObservationLayout:
             for name in ('opponent_mask', 'obstacle_mask', 'teammate_mask')
         ])
 
+    @property
+    def opponent_mask_indices(self) -> np.ndarray:
+        """Indices, within one camera observation, of the per-target presence flags.
+
+        Their mean over targets, after an OR across cameras, is exactly MATE's
+        coverage rate -- so a reader holding a predicted observation can score it
+        without reconstructing the geometry.
+        """
+
+        return np.arange(self.obs_dim)[self.slices['opponent_mask']]
+
     def joint_binary_channel_indices(self, num_agents: int) -> np.ndarray:
         """The same indices into a joint observation flattened as ``(n * obs_dim)``.
 
