@@ -344,7 +344,11 @@ class DreamerLearner:
         torch.set_rng_state(state['torch_rng'].cpu().to(torch.uint8))
         np.random.set_state(state['numpy_rng'])
         if 'cuda_rng' in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state['cuda_rng'])
+            # torch.load put every tensor on config.DEVICE, but set_rng_state_all
+            # only accepts CPU ByteTensors and rejects the CUDA copies outright.
+            torch.cuda.set_rng_state_all(
+                [rng.cpu().to(torch.uint8) for rng in state['cuda_rng']]
+            )
 
         if ckpt.get('has_buffer'):
             self.replay_buffer.load_state_dict(state['replay_buffer'])
