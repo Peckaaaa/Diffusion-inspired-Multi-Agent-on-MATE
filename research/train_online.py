@@ -65,6 +65,27 @@ def _collect_episode(env, planner, *, episode: int, seed: int, max_steps: int):
     return to_dima_rollout(result, env.n_actions), result.metrics
 
 
+def action_entropy(rollout) -> float:
+    """Entropy of the actions actually taken, in nats, averaged over agents.
+
+    A collapsed policy reports 0.  That is worth a column of its own because the
+    collapse is otherwise invisible here: the first MATE run finished with every
+    camera emitting a single action on every step, while its coverage sat at a
+    perfectly plausible-looking 0.39 and nothing in the log said otherwise.
+    """
+
+    actions = np.asarray(rollout['action'])
+    if actions.ndim == 3:  # one-hot (T, agents, |A|)
+        actions = actions.argmax(-1)
+
+    entropies = []
+    for agent in range(actions.shape[1]):
+        counts = np.bincount(actions[:, agent].astype(np.int64))
+        probs = counts[counts > 0] / counts.sum()
+        entropies.append(float(-(probs * np.log(probs)).sum()))
+    return float(np.mean(entropies)) if entropies else 0.0
+
+
 def train(
     run_dir: Path,
     *,
@@ -89,6 +110,7 @@ def train(
     obs_vocab_size: Optional[int] = None,
     num_steps_denoising: Optional[int] = None,
     agent_order: Optional[str] = None,
+    entropy: Optional[float] = None,
     save_every: int = 25,
     val_episodes: int = 20,
     eval_every: int = 50,
@@ -138,6 +160,8 @@ def train(
         overrides['num_steps_denoising'] = int(num_steps_denoising)
     if agent_order is not None:
         overrides['agent_order'] = str(agent_order)
+    if entropy is not None:
+        overrides['ENTROPY'] = float(entropy)
 
     config = build_learner_config(
         env,
@@ -224,6 +248,14 @@ def train(
             'ONLINE',
             f'batch sizes: state_decoder={config.state_decoder_batch_size} '
             f'denoiser={config.denoiser_batch_size} rew_end={config.rew_end_batch_size}',
+        )
+        # The sampler schedule decides how much of each agent's action reaches the
+        # predicted state, so a run is not reproducible from the log without it.
+        log(
+            'ONLINE',
+            f'sampler: num_steps_denoising={config.diffusion_sampler_cfg.num_steps_denoising} '
+            f'agent_order={config.diffusion_sampler_cfg.agent_order!r} '
+            f'binary_loss_weight={config.obs_binary_loss_weight}',
         )
 
         checkpoint = run_dir / 'ckpt' / 'model_final.pth'
@@ -395,6 +427,7 @@ def train(
                 fed_steps += len(rollout['done'])
                 coverage = float(metrics['mean_coverage_rate'])
                 coverage_history.append(coverage)
+                entropy_nats = action_entropy(rollout)
                 episode_index += 1
 
                 logger.scalars(
@@ -405,6 +438,7 @@ def train(
                         'buffer_steps': learner.replay_buffer.num_steps,
                         'train_count': learner.train_count,
                         'warmup': float(warming_up),
+                        'action_entropy': entropy_nats,
                     },
                     step=episode_index,
                     prefix='online/',
@@ -416,6 +450,7 @@ def train(
                         'ONLINE',
                         f'episode {episode_index} policy={name} '
                         f'coverage={coverage:.3f} (last{len(recent)}={np.mean(recent):.3f}) '
+                        f'act_entropy={entropy_nats:.3f} '
                         f'fed_steps={fed_steps} buffer={learner.replay_buffer.num_steps} '
                         f'train_count={learner.train_count} '
                         f'elapsed={elapsed_before_resume + time.time() - started:.0f}s',
@@ -502,6 +537,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         choices=['default', 'reverse', 'random', 'tiled'],
                         help="order actions condition the denoising steps in; 'tiled' gives every "
                              'agent a low-sigma slot instead of one sigma band each')
+    parser.add_argument('--entropy', type=float, default=None,
+                        help="actor entropy coefficient (DIMA's default 0.001 comes from SMAC; a "
+                             '25-action discrete policy collapses to one action at that value)')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -535,6 +573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         obs_vocab_size=args.obs_vocab_size,
         num_steps_denoising=args.num_steps_denoising,
         agent_order=args.agent_order,
+        entropy=args.entropy,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
         eval_every=args.eval_every,

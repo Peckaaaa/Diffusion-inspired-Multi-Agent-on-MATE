@@ -334,6 +334,7 @@ def export_checkpoint_config(config, path) -> 'Path':
 
     payload = {field: _jsonable(getattr(config, field)) for field in CHECKPOINT_CONFIG_FIELDS}
     payload['num_steps_denoising'] = int(config.diffusion_sampler_cfg.num_steps_denoising)
+    payload['agent_order'] = str(config.diffusion_sampler_cfg.agent_order)
     payload['num_steps_conditioning'] = int(
         config.denoiser_cfg.inner_model.num_steps_conditioning
     )
@@ -370,6 +371,8 @@ def apply_checkpoint_config(config, checkpoint_path) -> Optional[Dict[str, Any]]
     config.trans_config.max_blocks = config.horizon
     if 'num_steps_denoising' in payload:
         config.diffusion_sampler_cfg.num_steps_denoising = int(payload['num_steps_denoising'])
+    if payload.get('agent_order'):
+        config.diffusion_sampler_cfg.agent_order = str(payload['agent_order'])
     return payload
 
 

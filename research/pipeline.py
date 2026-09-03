@@ -93,6 +93,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_vocab_size=None,
         num_steps_denoising=None,
         agent_order=None,
+        entropy=None,
         sensitivity_samples=2,
         # DIMA's original batch sizes: the raised defaults would demand a bigger
         # replay buffer than this preset ever collects.
@@ -124,6 +125,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_vocab_size=None,
         num_steps_denoising=None,
         agent_order=None,
+        entropy=None,
         sensitivity_samples=4,
         eval_episodes=10,
         eval_max_episode_steps=150,
@@ -149,6 +151,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_vocab_size=None,
         num_steps_denoising=None,
         agent_order=None,
+        entropy=None,
         sensitivity_samples=8,
         # 10 x 150 is the protocol the README's published baseline matrix used, so
         # a server run stays comparable to it.  It is also as much as the `oracle`
@@ -181,6 +184,7 @@ _OVERRIDE_FIELDS = (
     'obs_vocab_size',
     'num_steps_denoising',
     'agent_order',
+    'entropy',
     'sensitivity_samples',
     'eval_episodes',
     'eval_max_episode_steps',
@@ -490,6 +494,7 @@ def run_pipeline(
                 obs_vocab_size=size['obs_vocab_size'],
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
+                entropy=size['entropy'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -529,6 +534,7 @@ def run_pipeline(
                 obs_vocab_size=size['obs_vocab_size'],
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
+                entropy=size['entropy'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -644,6 +650,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     sizes.add_argument('--agent-order', default=None,
                        choices=['default', 'reverse', 'random', 'tiled'],
                        help="'tiled' gives every agent a low-sigma slot instead of one band each")
+    sizes.add_argument('--entropy', type=float, default=None,
+                       help="actor entropy coefficient (default 0.001, inherited from DIMA's SMAC "
+                            'config; too small to stop a 25-action policy collapsing)')
     sizes.add_argument('--sensitivity-samples', type=int, default=None)
     sizes.add_argument('--eval-episodes', type=int, default=None)
     sizes.add_argument('--eval-max-episode-steps', type=int, default=None)

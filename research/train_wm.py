@@ -153,6 +153,7 @@ def train(
     obs_vocab_size: Optional[int] = None,
     num_steps_denoising: Optional[int] = None,
     agent_order: Optional[str] = None,
+    entropy: Optional[float] = None,
     train_actor_critic: bool = False,
     save_every: int = 1,
     val_episodes: int = 20,
@@ -204,6 +205,8 @@ def train(
         overrides['num_steps_denoising'] = int(num_steps_denoising)
     if agent_order is not None:
         overrides['agent_order'] = str(agent_order)
+    if entropy is not None:
+        overrides['ENTROPY'] = float(entropy)
 
     config = build_learner_config(
         env,
@@ -320,6 +323,14 @@ def train(
             'WM',
             f'batch sizes: state_decoder={config.state_decoder_batch_size} '
             f'denoiser={config.denoiser_batch_size} rew_end={config.rew_end_batch_size}',
+        )
+        # The sampler schedule decides how much of each agent's action reaches the
+        # predicted state, so a run is not reproducible from the log without it.
+        log(
+            'WM',
+            f'sampler: num_steps_denoising={config.diffusion_sampler_cfg.num_steps_denoising} '
+            f'agent_order={config.diffusion_sampler_cfg.agent_order!r} '
+            f'binary_loss_weight={config.obs_binary_loss_weight}',
         )
 
         rng = np.random.default_rng(seed)
@@ -573,6 +584,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         choices=['default', 'reverse', 'random', 'tiled'],
                         help="order actions condition the denoising steps in; 'tiled' gives every "
                              'agent a low-sigma slot instead of one sigma band each')
+    parser.add_argument('--entropy', type=float, default=None,
+                        help="actor entropy coefficient (DIMA's default 0.001 comes from SMAC; a "
+                             '25-action discrete policy collapses to one action at that value)')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: pass the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -604,6 +618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         obs_vocab_size=args.obs_vocab_size,
         num_steps_denoising=args.num_steps_denoising,
         agent_order=args.agent_order,
+        entropy=args.entropy,
         train_actor_critic=args.train_actor_critic,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
