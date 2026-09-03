@@ -176,9 +176,12 @@ def _seeded_predict(model, history, action, seed: int) -> np.ndarray:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    return np.asarray(
-        model.predict(history, np.asarray(action), horizon=1).states[0, 0], dtype=np.float64
+    prediction = model.predict(history, np.asarray(action), horizon=1)
+    state = np.asarray(prediction.states[0, 0], dtype=np.float64)
+    reward = (
+        float(prediction.rewards[0, 0]) if prediction.rewards is not None else float('nan')
     )
+    return state, reward
 
 
 def action_effect(
@@ -215,6 +218,7 @@ def action_effect(
     usable = [e for e in episodes if len(e.transitions) > conditioning + 1]
 
     effects, noises, extremes = [], [], []
+    reward_spreads, reward_noises, reward_extremes = [], [], []
     per_camera: List[List[float]] = []
     identical_pairs = 0
     compared_pairs = 0
@@ -235,13 +239,16 @@ def action_effect(
         # not say how much the action moves the prediction in general.
         per_camera_now = []
         for camera in range(num_agents):
-            preds = []
+            preds, rew = [], []
             for a in action_grid:
                 joint = base.copy()
                 joint[camera] = a
-                preds.append(_seeded_predict(model, history, joint, seed))
+                state, reward = _seeded_predict(model, history, joint, seed)
+                preds.append(state)
+                rew.append(reward)
             preds = np.stack(preds)
             per_camera_now.append(_pairwise_mean_distance(preds))
+            reward_spreads.append(float(np.nanstd(rew)))
 
             for x in range(len(preds)):
                 for y in range(x + 1, len(preds)):
@@ -253,17 +260,20 @@ def action_effect(
         effects.append(float(np.mean(per_camera_now)))
 
         # Same action, different noise: the scale to read `effect` against.
-        noise_preds = np.stack(
-            [_seeded_predict(model, history, base, seed + 1000 * k) for k in range(noise_seeds)]
-        )
+        noise_pairs = [
+            _seeded_predict(model, history, base, seed + 1000 * k) for k in range(noise_seeds)
+        ]
+        noise_preds = np.stack([p for p, _ in noise_pairs])
         noises.append(_pairwise_mean_distance(noise_preds))
+        reward_noises.append(float(np.nanstd([r for _, r in noise_pairs])))
 
         # The two furthest-apart joint actions, noise held fixed.
-        low = _seeded_predict(model, history, np.zeros(num_agents, dtype=np.int64), seed)
-        high = _seeded_predict(
+        low, low_rew = _seeded_predict(model, history, np.zeros(num_agents, dtype=np.int64), seed)
+        high, high_rew = _seeded_predict(
             model, history, np.full(num_agents, num_actions - 1, dtype=np.int64), seed
         )
         extremes.append(float(np.linalg.norm(high - low)))
+        reward_extremes.append(abs(high_rew - low_rew))
 
     effect = float(np.mean(effects))
     noise = float(np.mean(noises))
@@ -283,6 +293,16 @@ def action_effect(
         ),
         'identical_pairs': identical_pairs,
         'compared_pairs': compared_pairs,
+        # The reward head, measured the same way.  This is the quantity the actor's
+        # lambda-return is built from, so it -- not the state -- is what decides
+        # whether learning in imagination can teach a policy anything at all.
+        'reward_effect': float(np.nanmean(reward_spreads)),
+        'reward_noise': float(np.nanmean(reward_noises)),
+        'reward_effect_over_noise': (
+            float(np.nanmean(reward_spreads) / np.nanmean(reward_noises))
+            if np.nanmean(reward_noises) else float('inf')
+        ),
+        'reward_extreme_effect': float(np.nanmean(reward_extremes)),
     }
 
 
@@ -647,6 +667,11 @@ def _run_action_effect(args) -> Dict[str, object]:
     log('PROBE', f'  effect / noise                  {report["effect_over_noise"]:.4f}')
     log('PROBE', f'  extreme action pair             {report["extreme_effect"]:.4f} '
                  f'({report["extreme_over_noise"]:.4f} x noise)')
+    log('PROBE', '--- reward head (what the actor actually learns from) ---')
+    log('PROBE', f'  reward effect (vary action)     {report["reward_effect"]:.6f}')
+    log('PROBE', f'  reward noise  (vary seed)       {report["reward_noise"]:.6f}')
+    log('PROBE', f'  reward effect / noise           {report["reward_effect_over_noise"]:.4f}')
+    log('PROBE', f'  extreme action pair             {report["reward_extreme_effect"]:.6f}')
     log('PROBE', f'  bitwise-identical pairs         {report["identical_pairs"]}'
                  f'/{report["compared_pairs"]}')
     log('PROBE', '--- reading this ---')
