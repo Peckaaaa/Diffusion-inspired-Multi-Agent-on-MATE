@@ -39,6 +39,12 @@ from mate import constants as consts
 __all__ = ['SceneView', 'ObservationLayout']
 
 
+#: Below these a predicted camera does not describe a viewing cone at all, and
+#: :meth:`SceneView.margin_to` reports the floor margin instead of dividing by it.
+MIN_HALF_ANGLE_DEGREES = 1.0
+MIN_SIGHT_RANGE = 1.0
+
+
 class ObservationLayout:
     """Cached slice/index bookkeeping for one environment size."""
 
@@ -242,12 +248,28 @@ class SceneView:
         bearing = np.rad2deg(np.arctan2(delta[..., 1], delta[..., 0]))
         offset = np.abs(((bearing - self.camera_orientations[:, np.newaxis]) + 180.0) % 360.0 - 180.0)
 
-        half_angle = np.maximum(self.camera_viewing_angles[:, np.newaxis] / 2.0, 1e-6)
-        sight = np.maximum(self.camera_sight_ranges[:, np.newaxis], 1e-6)
+        half_angle = self.camera_viewing_angles[:, np.newaxis] / 2.0
+        sight = self.camera_sight_ranges[:, np.newaxis]
 
-        angular = 1.0 - offset / half_angle
-        radial = 1.0 - distance / sight
-        return np.minimum(np.minimum(angular, radial), 1.0)
+        # A camera with no aperture or no range covers nothing, and its margin is
+        # -1 -- the same floor margin_matrix uses -- rather than a number produced
+        # by dividing through a 1e-6 guard.  This matters only for *predicted*
+        # geometry: MATE never emits either, but a world model does, and one such
+        # prediction used to yield a margin near -1e8 that then decided the whole
+        # ranking it appeared in.
+        # Bounded below, not just non-positive: a predicted aperture of 0.001
+        # degrees is as meaningless as one of 0, yet divides through to a margin
+        # of -1e7.  One degree of half-angle and one world unit of range are the
+        # smallest values that describe a camera at all, in an arena that spans
+        # +-2000 units.
+        degenerate = (half_angle < MIN_HALF_ANGLE_DEGREES) | (sight < MIN_SIGHT_RANGE)
+        safe_half_angle = np.where(degenerate, 1.0, half_angle)
+        safe_sight = np.where(degenerate, 1.0, sight)
+
+        angular = 1.0 - offset / safe_half_angle
+        radial = 1.0 - distance / safe_sight
+        margin = np.minimum(np.minimum(angular, radial), 1.0)
+        return np.where(degenerate, -1.0, margin)
 
     def margin_matrix(self) -> np.ndarray:
         """``(C, T)`` float: normalised margin to camera ``c``'s field-of-view boundary.

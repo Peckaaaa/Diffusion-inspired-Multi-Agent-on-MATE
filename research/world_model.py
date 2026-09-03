@@ -369,7 +369,8 @@ class DIMAWorldModel(WorldModel):
         config.load_pretrained = True
         # Accept the resumable checkpoint as well as a plain weights one; see
         # research/config.py.  load_pretrained only reads the flat shape.
-        config.load_path = str(resolve_weights_checkpoint(checkpoint_path))
+        weights_path = str(resolve_weights_checkpoint(checkpoint_path))
+        config.load_path = weights_path
 
         from agent.learners.DreamerLearner import DreamerLearner
 
@@ -397,7 +398,7 @@ class DIMAWorldModel(WorldModel):
         # this object only ever runs forward passes.
         torch.autograd.set_detect_anomaly(False)
 
-        self._restore_state_rms(checkpoint_path)
+        self._restore_state_rms(weights_path)
 
         self._attach(
             self._learner, env, config, num_samples=num_samples, checkpoint_path=checkpoint_path
@@ -472,6 +473,16 @@ class DIMAWorldModel(WorldModel):
 
         self._camera_observation_space = env.camera_observation_space
         self._unrescale_obs = env.unrescale_obs
+        # MATE's own bounds on a camera observation.  A prediction outside them is
+        # not an observation the environment could ever emit, and a reader that
+        # takes it at face value gets nonsense: a negative predicted viewing angle
+        # sends SceneView.margin_to's normaliser to its 1e-6 floor and the margin
+        # to -1e8, which then dominates any planner's ranking.  Measured on a
+        # trained MATE-4v8-9 checkpoint, 3.3% of predicted viewing angles were
+        # negative, and the resulting utilities were six orders of magnitude out.
+        space = env.camera_observation_space
+        self._obs_low = np.asarray(space.low, dtype=np.float64).reshape(-1)
+        self._obs_high = np.asarray(space.high, dtype=np.float64).reshape(-1)
 
         # DiscreteCamera's grid is a meshgrid over [-1, 1]^2; the centre index is
         # the zero-delta ("hold") action.  levels**2 // 2 is that centre for any
@@ -636,6 +647,9 @@ class DIMAWorldModel(WorldModel):
             state_buffer[:, -1] = next_latent.squeeze(1)
 
         obs_world = self._unrescale_obs(obs_out.astype(np.float64))
+        # Non-finite bounds are left open by np.clip, so this only ever narrows to
+        # what MATE itself declares possible.
+        obs_world = np.clip(obs_world, self._obs_low, self._obs_high)
 
         if samples > 1:
             obs_world = obs_world.reshape(batch, samples, horizon, self.num_agents, self.obs_dim)
