@@ -87,6 +87,8 @@ def train(
     obs_binary_loss_weight: Optional[float] = None,
     nums_obs_token: Optional[int] = None,
     obs_vocab_size: Optional[int] = None,
+    num_steps_denoising: Optional[int] = None,
+    agent_order: Optional[str] = None,
     save_every: int = 25,
     val_episodes: int = 20,
     eval_every: int = 50,
@@ -132,6 +134,10 @@ def train(
         overrides['nums_obs_token'] = int(nums_obs_token)
     if obs_vocab_size is not None:
         overrides['OBS_VOCAB_SIZE'] = int(obs_vocab_size)
+    if num_steps_denoising is not None:
+        overrides['num_steps_denoising'] = int(num_steps_denoising)
+    if agent_order is not None:
+        overrides['agent_order'] = str(agent_order)
 
     config = build_learner_config(
         env,
@@ -489,6 +495,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help='VQ tokens the state is compressed into (default 12)')
     parser.add_argument('--obs-vocab-size', type=int, default=None,
                         help='VQ codebook size (default 128)')
+    parser.add_argument('--num-steps-denoising', type=int, default=None,
+                        help='diffusion steps per transition; must be a multiple of the agent '
+                             'count (default: one step per agent)')
+    parser.add_argument('--agent-order', default=None,
+                        choices=['default', 'reverse', 'random', 'tiled'],
+                        help="order actions condition the denoising steps in; 'tiled' gives every "
+                             'agent a low-sigma slot instead of one sigma band each')
     parser.add_argument('--resume', default=None,
                         help='continue from ckpt/latest.pth: the file, its run directory, '
                              'or wandb://entity/project/artifact:alias')
@@ -520,6 +533,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         obs_binary_loss_weight=args.obs_binary_loss_weight,
         nums_obs_token=args.nums_obs_token,
         obs_vocab_size=args.obs_vocab_size,
+        num_steps_denoising=args.num_steps_denoising,
+        agent_order=args.agent_order,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
         eval_every=args.eval_every,

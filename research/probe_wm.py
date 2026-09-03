@@ -578,6 +578,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--num-samples', type=int, default=1,
                         help='diffusion samples averaged per prediction')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--num-steps-denoising', type=int, default=None,
+                        help='override the sampler schedule; inference-only, no retraining needed')
+    parser.add_argument('--agent-order', default=None,
+                        choices=['default', 'reverse', 'random', 'tiled'],
+                        help='override the order actions condition denoising steps in')
     parser.add_argument('--action-effect', action='store_true',
                         help='measure how much the action moves the predicted state with the '
                              'diffusion noise pinned, instead of the full reconstruction probe')
@@ -587,6 +592,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _apply_sampler_overrides(model, args) -> None:
+    """Retune the sampler on an already-loaded model.
+
+    The EDM framework decouples inference-time sampling from training (the paper's
+    section E.5), so the schedule and the conditioning order can be changed on a
+    finished checkpoint without retraining anything.
+    """
+
+    cfg = model.sampler.cfg
+    if args.num_steps_denoising is not None:
+        cfg.num_steps_denoising = int(args.num_steps_denoising)
+        from agent.world_models.diffusion.diffusion_sampler import build_sigmas
+
+        model.sampler.sigmas = build_sigmas(
+            cfg.num_steps_denoising, cfg.sigma_min, cfg.sigma_max, cfg.rho,
+            model.sampler.denoiser.device,
+        )
+    if args.agent_order is not None:
+        cfg.agent_order = str(args.agent_order)
+    log('PROBE', f'sampler: num_steps_denoising={cfg.num_steps_denoising} '
+                 f'agent_order={cfg.agent_order!r}')
+
+
 def _run_action_effect(args) -> Dict[str, object]:
     manifest, rollouts = load_dataset(args.dataset)
     env = build_env_from_manifest(manifest, seed=args.seed)
@@ -594,6 +622,7 @@ def _run_action_effect(args) -> Dict[str, object]:
     model = DIMAWorldModel(
         env, _weights_checkpoint(args.checkpoint), device=args.device, num_samples=1
     )
+    _apply_sampler_overrides(model, args)
     episodes = [ValidationEpisode.from_rollout(r, env) for r in rollouts]
     report = action_effect(
         model,

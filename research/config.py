@@ -439,6 +439,28 @@ def build_learner_config(
         config.NUM_AGENTS if config.NUM_AGENTS > 2 else config.NUM_AGENTS * 2
     )
 
+    # Sampler knobs are reachable through `overrides` under these names, because
+    # they live on a nested dataclass that the flat override loop below cannot
+    # address.  Both change how much of each agent's action survives to the
+    # predicted state: see DiffusionSampler.sample_agent_order.
+    sampler_overrides = {
+        key: (overrides or {}).pop(key)
+        for key in ('num_steps_denoising', 'agent_order')
+        if key in (overrides or {})
+    }
+    for key, value in sampler_overrides.items():
+        setattr(
+            config.diffusion_sampler_cfg,
+            key,
+            int(value) if key == 'num_steps_denoising' else str(value),
+        )
+    steps = config.diffusion_sampler_cfg.num_steps_denoising
+    if steps % config.NUM_AGENTS:
+        raise ValueError(
+            f'num_steps_denoising={steps} must be a multiple of the {config.NUM_AGENTS} '
+            f'agents; DiffusionSampler.sample_agent_order asserts this.'
+        )
+
     if device is not None:
         config.DEVICE = device
 

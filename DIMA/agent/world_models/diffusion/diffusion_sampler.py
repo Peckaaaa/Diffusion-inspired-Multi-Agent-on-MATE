@@ -53,6 +53,17 @@ class DiffusionSampler:
         
         elif order == 'random':
             agent_order = torch.randperm(num_agents)
+
+        elif order == 'tiled':
+            # Every agent gets a slot in each sigma band rather than one band each.
+            # With num_steps_denoising == num_agents each agent conditions exactly
+            # one step, and sigma falls across those steps, so the agent that lands
+            # on the last step is the only one whose action survives to the output:
+            # measured on a trained MATE-4v8-9 checkpoint, camera 0 moved the
+            # prediction 0.1185 and cameras 1-3 moved it 0.012-0.017.  Tiling the
+            # order over more steps gives each agent a late, low-sigma slot.
+            repeats = self.cfg.num_steps_denoising // num_agents
+            agent_order = torch.flip(torch.arange(num_agents), [0]).repeat(repeats)
         
         else:
             raise NotImplementedError('Plz specify the agent order for denoising.')
@@ -97,7 +108,11 @@ class DiffusionSampler:
         agent_order = self.sample_agent_order(num_agents, self.cfg.agent_order)
 
         if self.cfg.num_steps_denoising != len(agent_order):
-            agent_order = torch.repeat_interleave(agent_order, repeats=2)
+            # 'tiled' already returns the full sequence; the others name one agent
+            # per band and are stretched to fill the schedule.
+            agent_order = torch.repeat_interleave(
+                agent_order, repeats=self.cfg.num_steps_denoising // len(agent_order)
+            )
             
         # 每一个sigma就是一个denoising step
         for idx, (sigma, next_sigma) in enumerate(zip(self.sigmas[:-1], self.sigmas[1:])):

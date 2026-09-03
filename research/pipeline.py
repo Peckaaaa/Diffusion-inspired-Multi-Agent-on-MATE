@@ -91,6 +91,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_binary_loss_weight=None,
         nums_obs_token=None,
         obs_vocab_size=None,
+        num_steps_denoising=None,
+        agent_order=None,
         sensitivity_samples=2,
         # DIMA's original batch sizes: the raised defaults would demand a bigger
         # replay buffer than this preset ever collects.
@@ -120,6 +122,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_binary_loss_weight=None,
         nums_obs_token=None,
         obs_vocab_size=None,
+        num_steps_denoising=None,
+        agent_order=None,
         sensitivity_samples=4,
         eval_episodes=10,
         eval_max_episode_steps=150,
@@ -143,6 +147,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         obs_binary_loss_weight=None,
         nums_obs_token=None,
         obs_vocab_size=None,
+        num_steps_denoising=None,
+        agent_order=None,
         sensitivity_samples=8,
         # 10 x 150 is the protocol the README's published baseline matrix used, so
         # a server run stays comparable to it.  It is also as much as the `oracle`
@@ -173,6 +179,8 @@ _OVERRIDE_FIELDS = (
     'obs_binary_loss_weight',
     'nums_obs_token',
     'obs_vocab_size',
+    'num_steps_denoising',
+    'agent_order',
     'sensitivity_samples',
     'eval_episodes',
     'eval_max_episode_steps',
@@ -480,6 +488,8 @@ def run_pipeline(
                 obs_binary_loss_weight=size['obs_binary_loss_weight'],
                 nums_obs_token=size['nums_obs_token'],
                 obs_vocab_size=size['obs_vocab_size'],
+                num_steps_denoising=size['num_steps_denoising'],
+                agent_order=size['agent_order'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -517,6 +527,8 @@ def run_pipeline(
                 obs_binary_loss_weight=size['obs_binary_loss_weight'],
                 nums_obs_token=size['nums_obs_token'],
                 obs_vocab_size=size['obs_vocab_size'],
+                num_steps_denoising=size['num_steps_denoising'],
+                agent_order=size['agent_order'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
                 threads=threads,
@@ -627,6 +639,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                        help='VQ tokens the state is compressed into (default 12)')
     sizes.add_argument('--obs-vocab-size', type=int, default=None,
                        help='VQ codebook size (default 128)')
+    sizes.add_argument('--num-steps-denoising', type=int, default=None,
+                       help='diffusion steps per transition; must be a multiple of the agent count')
+    sizes.add_argument('--agent-order', default=None,
+                       choices=['default', 'reverse', 'random', 'tiled'],
+                       help="'tiled' gives every agent a low-sigma slot instead of one band each")
     sizes.add_argument('--sensitivity-samples', type=int, default=None)
     sizes.add_argument('--eval-episodes', type=int, default=None)
     sizes.add_argument('--eval-max-episode-steps', type=int, default=None)
