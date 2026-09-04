@@ -136,8 +136,24 @@ The planner is swapped by name, never by editing the loop:
 ```bash
 python -m research.evaluate --planner reactive_greedy
 python -m research.evaluate --planner predictive_greedy --world-model dima --checkpoint <ckpt>
-python -m research.evaluate --planner oracle           --world-model oracle
+python -m research.evaluate --planner cem               --world-model dima --checkpoint <ckpt>
+python -m research.evaluate --planner oracle            --world-model oracle
 python -m research.evaluate --planner mypkg.mine:MyPlanner --world-model dima --checkpoint <ckpt>
+```
+
+`predictive_greedy` and `cem` are the same utility and the same world model under
+two different searches. The first is coordinate descent, one camera at a time; the
+second is the cross-entropy method over *joint* actions (`--cem-samples 128
+--cem-iterations 3 --cem-elite-frac 0.1`), which can express a trade between
+cameras that a per-camera sweep never reaches. Running `cem_oracle` against the
+oracle world model separates a search ceiling from a model error: coordinate
+descent reached only 33.12% coverage on MATE-4v8-9 even with perfect predictions,
+against 54.04% for the reactive heuristic.
+
+```bash
+# expensive -- the oracle forks MATE once per candidate; keep the episodes short
+python -m research.evaluate --planner cem_oracle --world-model oracle \
+    --episodes 3 --max-episode-steps 50
 ```
 
 ---
@@ -459,6 +475,25 @@ visible in the console. The two numbers to watch:
 | `sensitivity_ratio` | ↑, and **above 1.0** | action effect vs. diffusion sampling noise; below 1.0 no planner can use the model |
 
 A `[WARN]` fires on every validation where the ratio is still below 1.0.
+
+**Whose action is being measured.** A model can pass `sensitivity_ratio` while
+listening to only one camera. DIMA's original sampler exposed one agent's action
+per denoising step, and sigma falls across those steps, so the agent on the last
+step dominated: measured on MATE-4v8-9, 0.1029 against 0.0106 for the first-step
+agent, a 10:1 split that mirrored exactly when the order was reversed. Camera
+actions now condition every denoising step together
+(`--action-conditioning joint`, the default; `sequential` restores DIMA's scheme),
+which also frees `--num-denoising-steps` from having to divide by the agent count.
+`python -m research.probe_wm --action-effect` reports the per-camera split and
+their `max/min`, which should sit near 1.0:
+
+```
+[PROBE]     camera 0 effect 0.000406774  = 6.67288e-05 x noise
+[PROBE]     camera 1 effect 0.000416977  = 6.84025e-05 x noise
+[PROBE]     camera 2 effect 0.000469612  = 7.70369e-05 x noise
+[PROBE]     camera 3 effect 0.000432663  = 7.09757e-05 x noise
+[PROBE]   per-camera max/min              1.15448 (1.0 = every camera equally influential)
+```
 
 **Why `sighting_recall` comes first.** A camera observation encodes an unsighted
 target as a zeroed block, so `SceneView` reads its position as the origin. A model

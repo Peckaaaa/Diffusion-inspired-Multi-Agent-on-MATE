@@ -35,7 +35,7 @@ from research.diagnostics import (
 from research.config import configure_torch, default_device
 from research.env_adapter import DEFAULT_SCENARIO, MATEEnv
 from research.logging_utils import RunLogger, log
-from research.planners import build_planner, planner_class
+from research.planners import CEMPlanner, build_planner, planner_class
 from research.rollout import run_episode
 from research.views import ObservationLayout, SceneView
 from research.world_model import (
@@ -54,9 +54,19 @@ BASELINE_MATRIX = (
     ('mate_random', 'none'),
     ('reactive_greedy', 'none'),
     ('predictive_greedy', 'dima'),
+    ('cem', 'dima'),
     ('dima_actor', 'dima'),
     ('oracle', 'oracle'),
 )
+
+#: ``cem_oracle`` answers the planner-ceiling question -- does joint-space search
+#: beat coordinate descent when the model is perfect? -- but it is not in the
+#: matrix above because it cannot be afforded there: ``OracleWorldModel`` forks
+#: MATE once per candidate, so one step costs ``cem_samples * cem_iterations``
+#: environment steps (384 at the defaults) against the greedy sweep's 100.  Run it
+#: on its own, on a few short episodes:
+#:
+#:     python -m research.evaluate --planner cem_oracle --world-model oracle #:         --episodes 3 --max-episode-steps 50
 
 
 def build_world_model(
@@ -105,6 +115,9 @@ def evaluate(
     diagnostics: bool = False,
     diagnostic_states: int = 4,
     sensitivity_samples: int = 8,
+    cem_samples: int = 128,
+    cem_iterations: int = 3,
+    cem_elite_frac: float = 0.1,
 ) -> Dict[str, Any]:
     """Run one row of the baseline matrix."""
 
@@ -128,13 +141,23 @@ def evaluate(
     # search with the world model.  Some planners are handed a world model for
     # another reason -- ``dima_actor`` takes its policy network from it -- and
     # would reject the argument.
-    searches = planner_class(planner_spec).USES_WORLD_MODEL
+    cls = planner_class(planner_spec)
+    searches = cls.USES_WORLD_MODEL
+    planner_kwargs: Dict[str, Any] = {}
+    if searches and world_model is not None:
+        planner_kwargs['horizon'] = horizon
+        # Search-shape arguments only mean something to the planner that has that
+        # shape of search; the greedy sweep would reject them.
+        if issubclass(cls, CEMPlanner):
+            planner_kwargs.update(
+                samples=cem_samples, iterations=cem_iterations, elite_frac=cem_elite_frac
+            )
     planner = build_planner(
         planner_spec,
         env,
         world_model=world_model,
         seed=seed,
-        **({'horizon': horizon} if searches and world_model is not None else {}),
+        **planner_kwargs,
     )
 
     log('ENV', env.describe())
@@ -366,6 +389,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--diagnostic-states', type=int, default=4)
     parser.add_argument('--sensitivity-samples', type=int, default=8)
+    parser.add_argument('--cem-samples', type=int, default=128,
+                        help='joint actions drawn per CEM iteration')
+    parser.add_argument('--cem-iterations', type=int, default=3,
+                        help='CEM refit iterations per environment step')
+    parser.add_argument('--cem-elite-frac', type=float, default=0.1,
+                        help='fraction of each CEM draw kept as the elite set')
     parser.add_argument('--run-dir', type=Path, default=None)
     parser.add_argument('--wandb-mode', default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--tensorboard', action='store_true')
@@ -420,6 +449,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 diagnostics=args.diagnostics,
                 diagnostic_states=args.diagnostic_states,
                 sensitivity_samples=args.sensitivity_samples,
+                cem_samples=args.cem_samples,
+                cem_iterations=args.cem_iterations,
+                cem_elite_frac=args.cem_elite_frac,
             )
             summaries.append(summary)
             logger.records('summaries', [summary])

@@ -136,6 +136,13 @@ def rollout_policy_with_env(env, actor, critic, horizons):
 
         next_obs, next_shared_obs, rew, pcont, end, trunc, info = env.step(act)
         next_av_action = info.get('av_action', None)
+        # The observation this step's action *led to*.  `all_` records the
+        # observation the policy acted on, so a reward read out of the imagined
+        # observation (see DreamerLearner.imagined_coverage) would otherwise score
+        # the state before the action rather than after it -- and the successor of
+        # the final action is not in `all_` at all.  Recorded here, where the
+        # world model has just produced it, rather than reconstructed by shifting.
+        info['next_obs'] = next_obs
         
         if n > 0:
             val_bootstrap = val.detach().clone()
@@ -212,6 +219,13 @@ def rollout_policy_with_env_wo_reset(env, actor, critic, horizons):
 
         next_obs, next_shared_obs, rew, pcont, end, trunc, info = env.step(act)
         next_av_action = info.get('av_action', None)
+        # The observation this step's action *led to*.  `all_` records the
+        # observation the policy acted on, so a reward read out of the imagined
+        # observation (see DreamerLearner.imagined_coverage) would otherwise score
+        # the state before the action rather than after it -- and the successor of
+        # the final action is not in `all_` at all.  Recorded here, where the
+        # world model has just produced it, rather than reconstructed by shifting.
+        info['next_obs'] = next_obs
         
         if n > 0:
             val_bootstrap = val.detach().clone()

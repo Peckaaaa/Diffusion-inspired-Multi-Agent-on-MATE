@@ -64,6 +64,7 @@ __all__ = [
     'ReactiveGreedyPlanner',
     'DIMAActorPlanner',
     'ModelBasedGreedyPlanner',
+    'CEMPlanner',
     'PLANNER_REGISTRY',
     'NEEDS_ACTOR',
     'planner_class',
@@ -398,7 +399,9 @@ UTILITIES: Dict[str, Callable[[SceneView, np.ndarray, np.ndarray], np.ndarray]] 
 }
 
 
-def _reduce_margins(margins: np.ndarray, hard: bool, camera: int, local_weight: float) -> float:
+def _reduce_margins(
+    margins: np.ndarray, hard: bool, camera: Optional[int], local_weight: float
+) -> float:
     """Team score for one candidate, plus an optional local term for ``camera``.
 
     The team score is ``mean over targets of the best camera's margin`` -- the
@@ -418,7 +421,9 @@ def _reduce_margins(margins: np.ndarray, hard: bool, camera: int, local_weight: 
         return 0.0
     best = margins.max(axis=0)
     team = float((best >= 0.0).mean()) if hard else float(best.mean())
-    if local_weight == 0.0:
+    # ``camera`` is None when the candidate moves every camera at once (CEM), in
+    # which case there is no single camera whose gradient needs propping up.
+    if local_weight == 0.0 or camera is None:
         return team
     return team + local_weight * float(margins[camera].max())
 
@@ -586,7 +591,11 @@ class ModelBasedGreedyPlanner(Planner):
         return joint
 
     def _score(
-        self, prediction: Prediction, context: PlanContext, live: np.ndarray, camera: int
+        self,
+        prediction: Prediction,
+        context: PlanContext,
+        live: np.ndarray,
+        camera: Optional[int],
     ) -> np.ndarray:
         """Discounted sum of per-step utility over the prediction horizon."""
 
@@ -607,6 +616,157 @@ class ModelBasedGreedyPlanner(Planner):
         return utilities
 
 
+class CEMPlanner(ModelBasedGreedyPlanner):
+    """Cross-entropy method over *joint* camera actions.
+
+    Why a second model-based planner
+    --------------------------------
+    :class:`ModelBasedGreedyPlanner` searches by coordinate descent: it moves one
+    camera at a time with the others pinned.  That cannot express a trade -- two
+    cameras swapping which half of the arena they cover is worse at every single
+    step of the descent than the arrangement it starts from, so the sweep never
+    takes it.  Measured on MATE-4v8-9 the ceiling shows up even with a *perfect*
+    world model: 33.12% coverage against the oracle, while the reactive
+    ``GreedyCameraAgent`` heuristic reached 54.04%.  That gap is a search failure,
+    not a model failure, and no amount of world-model accuracy closes it.
+
+    CEM searches the joint space instead.  Each camera keeps its own categorical
+    distribution over its ``num_actions`` actions; every iteration draws ``samples``
+    joint actions from the product of those distributions, scores them **in one
+    batched world-model call** -- which is also what puts every candidate under the
+    same common random numbers (see ``DIMAWorldModel.predict``) -- keeps the best
+    ``elite_frac``, and refits the per-camera distributions to the elite set.
+
+    The refit is smoothed towards the previous distribution by ``alpha``: with 128
+    samples over 25 actions per camera an unsmoothed refit collapses onto whichever
+    handful of actions the first draw happened to favour.  Between steps the
+    distributions are reset to uniform, so a plan is not inherited from the
+    previous state's search; the incumbent joint action is injected as candidate 0
+    of the first iteration instead, which keeps the same "never worse than the
+    status quo under the model" property the greedy sweep has.
+
+    Cost is ``iterations`` world-model calls of batch ``samples`` per step, against
+    the greedy planner's ``cameras * sweeps`` calls of batch ``num_actions`` --
+    3 x 128 versus 4 x 25 on MATE-4v8-9.
+    """
+
+    def __init__(
+        self,
+        env: MATEEnv,
+        world_model: WorldModel,
+        *,
+        samples: int = 128,
+        iterations: int = 3,
+        elite_frac: float = 0.1,
+        alpha: float = 0.5,
+        local_weight: float = 0.0,
+        name: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            env,
+            world_model,
+            local_weight=local_weight,
+            name=name or f'cem({world_model.name})',
+            **kwargs,
+        )
+        self.samples = max(2, int(samples))
+        self.iterations = max(1, int(iterations))
+        self.elite_frac = float(elite_frac)
+        self.alpha = float(alpha)
+        # At least two, or the refit has nothing to average and CEM degenerates to
+        # "keep the single best sample", which is hill climbing with extra steps.
+        self.num_elites = max(2, min(self.samples, int(round(self.elite_frac * self.samples))))
+
+    def plan(self, observation, prediction, context) -> np.ndarray:
+        if context.history is None:
+            raise ValueError('CEMPlanner needs PlanContext.history.')
+
+        self._memory.update(
+            SceneView.from_joint_observation(observation.obs_raw, context.layout)
+        )
+        live = self._memory.live
+
+        if not live.any():
+            # Same no-target branch as the greedy planner: nothing to score means
+            # nothing for CEM to concentrate on, so scan and occasionally resample.
+            if self._rng.random() < self.exploration_prob:
+                self._base_action = self._rng.integers(
+                    0, self._num_actions, size=context.num_cameras
+                ).astype(np.int64)
+            self._diagnostics = {
+                'predicted_utility': float('nan'),
+                'base_utility': float('nan'),
+                'utility': self.utility_name,
+                'horizon': self.horizon,
+                'live_targets': 0,
+                'mode': 'explore',
+            }
+            return self._base_action.copy()
+
+        cameras = context.num_cameras
+        probs = np.full((cameras, self._num_actions), 1.0 / self._num_actions)
+
+        best_action = self._base_action.copy()
+        best_utility = -np.inf
+        base_utility = None
+        entropy = float('nan')
+
+        for _ in range(self.iterations):
+            candidates = np.stack(
+                [
+                    self._rng.choice(self._num_actions, size=self.samples, p=probs[c])
+                    for c in range(cameras)
+                ],
+                axis=1,
+            ).astype(np.int64)
+            # The incumbent, so a step is never scored worse than holding still.
+            candidates[0] = self._base_action
+
+            pred = self.world_model.predict(context.history, candidates, horizon=self.horizon)
+            utilities = self._score(pred, context, live, camera=None)
+
+            if base_utility is None:
+                base_utility = float(utilities[0])
+
+            elite_idx = np.argsort(utilities)[-self.num_elites:]
+            elites = candidates[elite_idx]
+
+            if float(utilities[elite_idx[-1]]) > best_utility:
+                best_utility = float(utilities[elite_idx[-1]])
+                best_action = candidates[elite_idx[-1]].copy()
+
+            counts = np.stack(
+                [np.bincount(elites[:, c], minlength=self._num_actions) for c in range(cameras)]
+            ).astype(np.float64)
+            # Laplace smoothing keeps every action reachable in the next draw: an
+            # action with no elite is unlikely, not impossible.
+            fitted = (counts + 1.0) / (counts.sum(axis=1, keepdims=True) + self._num_actions)
+            probs = self.alpha * fitted + (1.0 - self.alpha) * probs
+            probs /= probs.sum(axis=1, keepdims=True)
+
+            entropy = float(-np.sum(probs * np.log(probs + 1e-12), axis=1).mean())
+
+        self._base_action = best_action.copy()
+        self._diagnostics = {
+            'predicted_utility': best_utility,
+            'base_utility': base_utility if base_utility is not None else float('nan'),
+            'utility': self.utility_name,
+            'horizon': self.horizon,
+            'live_targets': int(live.sum()),
+            'samples': self.samples,
+            'iterations': self.iterations,
+            'num_elites': self.num_elites,
+            # How concentrated the per-camera distributions ended up.  Stuck at
+            # log(num_actions) means the elite set was no more informative than a
+            # uniform draw, which is the signature of a world model whose
+            # predictions do not depend on the action.
+            'action_dist_entropy': entropy,
+            'mode': 'plan',
+        }
+        return best_action
+
+
 # --------------------------------------------------------------------------- #
 # Registry (brief section 16)
 # --------------------------------------------------------------------------- #
@@ -622,11 +782,13 @@ PLANNER_REGISTRY: Dict[str, Type[Planner]] = {
     'heuristic': HeuristicPlanner,
     'predictive_greedy': ModelBasedGreedyPlanner,
     'oracle': ModelBasedGreedyPlanner,
+    'cem': CEMPlanner,
+    'cem_oracle': CEMPlanner,
     'dima_actor': DIMAActorPlanner,
 }
 
 #: Planners that must be handed a world model.
-NEEDS_WORLD_MODEL = frozenset({'predictive_greedy', 'oracle'})
+NEEDS_WORLD_MODEL = frozenset({'predictive_greedy', 'oracle', 'cem', 'cem_oracle'})
 
 #: Planners that act with DIMA's policy network.  They take it from the world model
 #: because that is where a checkpoint's actor is already loaded, but they never

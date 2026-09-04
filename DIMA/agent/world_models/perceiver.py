@@ -327,3 +327,88 @@ class SimpleActionEncoder(nn.Module):
             x = self_ff(x) + x
 
         return self.to_out(x)
+
+
+### Joint (unmasked) action conditioning
+class JointActionEmb(nn.Module):
+    """Embed every agent's action at every conditioning step, with no masking.
+
+    ``SequentialActionEmb`` above is the sequential-causal encoder: the sampler
+    hands it a mask that exposes one agent's action per denoising step, so the
+    agent that lands on the last, lowest-sigma step is the only one whose action
+    survives into the prediction.  Measured on a trained MATE-4v8-9 checkpoint the
+    last-step camera moved the predicted state by 0.1029 and the first-step one by
+    0.0106 -- a 10:1 split that is an artefact of the schedule, not of the
+    environment, and that no planner can compensate for.
+
+    This encoder takes the joint action instead.  Each agent gets its own
+    embedding table, so agent identity is carried by the table rather than by an
+    additive positional term; the per-agent vectors are concatenated (the joint
+    action, not a permutation-invariant pool of it), a conditioning-step embedding
+    is added, and a two-layer MLP projects the whole window to ``output_dim``.
+    Every agent therefore reaches ``cond`` -- and through ``AdaGroupNorm``'s FiLM
+    modulation, every ResBlock -- identically at every denoising step.
+
+    ``mask`` is accepted and ignored: the sampler still computes one for the
+    sequential encoder, and taking it here keeps the two interchangeable.
+    """
+
+    def __init__(
+        self,
+        num_agents: int,
+        num_steps_conditioning: int,
+        action_dim: int,
+        is_continuous_act: bool,
+        output_dim: int,
+        agent_embed_dim: int = 64,
+        hidden_dim: Optional[int] = None,
+    ):
+        super().__init__()
+
+        self.num_agents = num_agents
+        self.num_steps_conditioning = num_steps_conditioning
+        self.agent_embed_dim = agent_embed_dim
+        self.is_continuous_act = is_continuous_act
+
+        if is_continuous_act:
+            self.token_emb = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(action_dim, agent_embed_dim),
+                    nn.SiLU(),
+                    nn.Linear(agent_embed_dim, agent_embed_dim),
+                )
+                for _ in range(num_agents)
+            ])
+        else:
+            self.token_emb = nn.ModuleList([
+                nn.Embedding(action_dim, agent_embed_dim) for _ in range(num_agents)
+            ])
+
+        joint_dim = num_agents * agent_embed_dim
+        self.timestep_emb = nn.Embedding(num_steps_conditioning, joint_dim)
+
+        hidden_dim = hidden_dim if hidden_dim is not None else output_dim
+        self.proj = nn.Sequential(
+            nn.Linear(num_steps_conditioning * joint_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x, mask=None, return_cross_attn=False):
+        b, t, n = x.shape[:3]
+        assert n == self.num_agents, f'expected {self.num_agents} agents, got {n}'
+        assert t == self.num_steps_conditioning, (
+            f'expected {self.num_steps_conditioning} conditioning steps, got {t}'
+        )
+        device = x.device
+
+        # One table per agent: index the agent axis rather than adding an agent
+        # embedding, so nothing about the joint action is averaged away.
+        per_agent = [self.token_emb[i](x[:, :, i]) for i in range(n)]
+        joint = torch.cat(per_agent, dim=-1)                    # (b, t, n * agent_embed_dim)
+
+        t_emb = self.timestep_emb(torch.arange(t, device=device))
+        joint = joint + rearrange(t_emb, 't d -> () t d')
+
+        act_cond = self.proj(joint.reshape(b, -1))
+        return act_cond, None

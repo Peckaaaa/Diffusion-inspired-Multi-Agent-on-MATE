@@ -1,8 +1,9 @@
 # Modifications to the upstream repositories
 
-Four files under `DIMA/` are modified. **`mate/` is byte-for-byte upstream.**
-Every edit is additive -- a new `Env.MATE` branch, or a new method -- and no
-existing code path changes behaviour.
+Eleven files under `DIMA/` are modified. **`mate/` is byte-for-byte upstream.**
+Patches 1-3 are purely additive. Patches 4-6 change behaviour, but each one is
+gated on a config field that defaults to DIMA's original behaviour, so an
+unmodified DIMA config still trains exactly as it did.
 
 [`upstream-patches.diff`](upstream-patches.diff) currently carries patches 1 and 2
 only; regenerate it against the pinned commits to include the checkpointing
@@ -107,6 +108,121 @@ behave exactly as before.
 `research/train_wm.py --resume` is the only caller. The replay buffer is included
 only when `--save-buffer` is passed, because `MultiAgentEpisodesDataset` holds raw
 rollouts and the checkpoint would otherwise grow by gigabytes.
+
+---
+
+## 4. Joint action conditioning --- `perceiver.py`, `inner_model.py`, `denoiser.py`, `diffusion_sampler.py`
+
+Adds `JointActionEmb` next to `SequentialActionEmb`, a
+`StateInnerModelConfig.action_cond` field selecting between them, and the two
+branches in `Denoiser.forward` / `DiffusionSampler.sample` that stop building a
+single-agent `act_mask` when the joint encoder is selected.
+
+### The defect
+
+`DiffusionSampler.sample` exposed one agent's action per denoising step through
+`act_mask`, and the Perceiver's cross-attention mask hid the other three. Sigma
+falls across those steps, so the agent that landed on the last, lowest-sigma step
+is the one whose action survives into the output. Measured with common random
+numbers on a trained MATE-4v8-9 checkpoint: the last-step camera moved the
+predicted state by 0.1029, the first-step one by 0.0106. Reversing `agent_order`
+mirrored the split exactly, which is what identifies it as an artefact of the
+schedule rather than of the environment.
+
+Any planner built on that model is choosing three of four camera actions almost
+blind, and the `tiled` order added earlier only spreads the problem thinner
+rather than removing it.
+
+### The change
+
+`action_cond = 'joint'` embeds each agent's action with its own
+`nn.Embedding(num_actions, 64)` table, concatenates them into the joint action,
+adds a conditioning-step embedding and projects with a two-layer MLP. The result
+enters the existing `cond` vector, and therefore every ResBlock's `AdaGroupNorm`
+--- which is already FiLM (`x * (1 + scale) + shift`), so no new modulation
+mechanism is introduced. Every denoising step sees the same, whole joint action.
+
+Measured on the untrained wiring, averaged over 5 seeds
+(`research/scripts/check_action_symmetry.py`), the per-camera effect ratio is
+1.12:1 under `joint` and 2.95:1 under `sequential`.
+
+### Knock-on simplification
+
+`num_steps_denoising` no longer has to be a multiple of the agent count: nothing
+about the schedule encodes agent identity any more. `--num-denoising-steps` is
+free under `joint` and still validated under `sequential`.
+
+### Default
+
+`StateInnerModelConfig.action_cond` defaults to `'sequential'`, so DIMA is
+unchanged. `research/config.py` sets `'joint'` for MATE, and records it in the
+checkpoint sidecar; a sidecar without the field describes a checkpoint that
+predates it and is therefore read as `'sequential'`.
+
+---
+
+## 5. A separate decoder branch for 0/1 flags --- `vq.py`, `DreamerLearner.py`
+
+Adds `_BinaryFlagHead` plus a `binary_indices` argument to both autoencoders, and
+switches `DreamerLearner._reconstruction_loss`'s flag block to
+`BCEWithLogitsLoss(pos_weight=...)`.
+
+### The defect
+
+On MATE-4v8-9 the state decoder reconstructs 4 x 21 = 84 sighting / obstacle /
+teammate flags together with 420 continuous channels, from 12 quantised tokens.
+The flags are positive 13.6% of the time. Under the shared L1 head their optimum
+is the conditional median --- 0 --- so the decoder predicted "never"; sighting
+recall stalled at 0.25-0.31. Weighting a squared error instead moved the optimum
+to the conditional mean but left the rare class contributing 13.6% of the
+gradient, which was not enough.
+
+### The change
+
+The flags get their own two-layer head off the same quantised latent, emitting
+logits, and a positive-weighted BCE. `pos_weight` defaults to 6.0, the
+`(1 - p) / p` ratio at the measured positive rate.
+
+`forward` (the training path) scatters the head's **logits** into the flag
+channels; `encode_decode` (every inference path: `WorldModelEnv.step`,
+`DIMAWorldModel.predict`, `log_compounding_errors`) scatters `sigmoid(logits)`.
+Every downstream reader already applies a 0.5 cut to those channels and keeps
+working unchanged, and MATE rescales a 0/1 flag to itself, so the cut still means
+what it did.
+
+### Default
+
+`obs_binary_head` defaults to `False`; the branch is built only when the
+environment names flag channels *and* the run asks for it. It is recorded in the
+sidecar, and its absence there means a checkpoint written before it existed.
+
+---
+
+## 6. Imagined reward reads the successor observation --- `env_loop.py`, `loss.py`, `DreamerLearner.py`
+
+`rollout_policy_with_env{,_wo_reset}` record `info['next_obs']`,
+`rollout_diffusion_world_models` returns the stacked sequence, and
+`DreamerLearner.imagined_coverage` scores that instead of `obs`.
+
+### The defect
+
+The rollout's `obs[:, n]` is the observation the policy *acted on*, so a coverage
+reward read from it does not depend on action `n` at all --- it was settled before
+the action was taken. The first fix shifted the series by one, which is right for
+every step but the last, whose successor is not in `obs` at all and which
+therefore kept its own value.
+
+### The change
+
+The successor observation is recorded where the world model produces it, so the
+reward for acting at step `n` is the coverage of the state that action reached,
+for every step including the last. Nothing is reconstructed by shifting.
+
+### Default
+
+Only read when `imagined_reward == 'coverage'`, which is off by default. The extra
+tensor is collected unconditionally; it is one imagined observation per step, next
+to the denoising trajectory the same dict already carries.
 
 ---
 

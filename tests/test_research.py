@@ -333,8 +333,11 @@ class TestDIMAInterop(unittest.TestCase):
             self.assertEqual(config.ACTION_SIZE, env.n_actions)
             self.assertEqual(config.NUM_AGENTS, env.n_agents)
             self.assertFalse(config.CONTINUOUS_ACTION)
-            # DiffusionSampler.sample_agent_order asserts this divisibility.
-            self.assertEqual(config.diffusion_sampler_cfg.num_steps_denoising % config.NUM_AGENTS, 0)
+            # The default is still one denoising step per agent, but under joint
+            # action conditioning that is a default, not a constraint --
+            # sample_agent_order is not reached at all.
+            self.assertEqual(config.diffusion_sampler_cfg.num_steps_denoising, config.NUM_AGENTS)
+            self.assertEqual(config.denoiser_cfg.inner_model.action_cond, 'joint')
             self.assertEqual(config.rew_end_model_type, 'transformer')
         finally:
             env.close()

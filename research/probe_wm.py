@@ -232,11 +232,13 @@ def action_effect(
         base = np.asarray(episode.transitions[t].action, dtype=np.int64).reshape(-1)
         seed = 10_000 + i
 
-        # One camera at a time, everything else pinned.  Which camera matters:
-        # sample_agent_order reverses the agent index, so camera n-1 conditions the
-        # first denoising step (highest sigma, coarse structure) and camera 0 the
-        # last (lowest sigma, final refinement).  Measuring only one of them would
-        # not say how much the action moves the prediction in general.
+        # One camera at a time, everything else pinned.  Which camera matters under
+        # sequential conditioning: sample_agent_order reverses the agent index, so
+        # camera n-1 conditions the first denoising step (highest sigma, coarse
+        # structure) and camera 0 the last (lowest sigma, final refinement), and
+        # the spread between them is the schedule artefact this probe exists to
+        # expose.  Under joint conditioning there is no such assignment and the
+        # cameras should come out level; the per-camera numbers are the test.
         per_camera_now = []
         for camera in range(num_agents):
             preds, rew = [], []
@@ -631,8 +633,12 @@ def _apply_sampler_overrides(model, args) -> None:
         )
     if args.agent_order is not None:
         cfg.agent_order = str(args.agent_order)
+    action_cond = model.config.denoiser_cfg.inner_model.action_cond
     log('PROBE', f'sampler: num_steps_denoising={cfg.num_steps_denoising} '
-                 f'agent_order={cfg.agent_order!r}')
+                 f'action_cond={action_cond!r} agent_order={cfg.agent_order!r}')
+    if action_cond == 'joint' and args.agent_order is not None:
+        log('WARN', 'this checkpoint conditions every denoising step on the whole joint '
+                    'action, so --agent-order changes nothing; it is reported for the record.')
 
 
 def _run_action_effect(args) -> Dict[str, object]:
@@ -653,16 +659,34 @@ def _run_action_effect(args) -> Dict[str, object]:
         states=args.states,
     )
     report['checkpoint'] = str(args.checkpoint)
+    report['action_cond'] = str(model.config.denoiser_cfg.inner_model.action_cond)
+    report['num_steps_denoising'] = int(model.sampler.cfg.num_steps_denoising)
 
     log('PROBE', f'checkpoint {args.checkpoint}')
     log('PROBE', f'{report["states"]} states x {report["candidates"]} candidate actions, '
                  f'diffusion noise pinned per state')
-    log('PROBE', f'  action effect (mean over cameras) {report["effect"]:.4f}')
+    log('PROBE', f'  action effect (mean over cameras) {report["effect"]:.6g}')
+    per_camera = list(report['per_camera_effect'])
     for cam, (eff, ratio) in enumerate(
-        zip(report['per_camera_effect'], report['per_camera_over_noise'] or [])
+        zip(per_camera, report['per_camera_over_noise'] or [])
     ):
-        log('PROBE', f'    camera {cam} (denoising step {report["num_agents"] - 1 - cam}) '
-                     f'effect {eff:.4f}  = {ratio:.4f} x noise')
+        # The denoising step a camera was assigned only exists under sequential
+        # conditioning; naming one under joint would invent an ordering that the
+        # sampler no longer has.
+        where = (
+            '' if report.get('action_cond') == 'joint'
+            else f' (denoising step {report["num_agents"] - 1 - cam})'
+        )
+        log('PROBE', f'    camera {cam}{where} effect {eff:.6g}  = {ratio:.6g} x noise')
+    if per_camera and min(per_camera) > 0.0:
+        # The headline number for the schedule artefact: 1.0 means every camera's
+        # action moves the prediction equally, which is what joint conditioning is
+        # for.  Measured at 10:1 on a sequentially-conditioned MATE-4v8-9 model.
+        log(
+            'PROBE',
+            f'  per-camera max/min              {max(per_camera) / min(per_camera):.6g} '
+            f'(1.0 = every camera equally influential)',
+        )
     log('PROBE', f'  noise floor   (vary seed)       {report["noise"]:.4f}')
     log('PROBE', f'  effect / noise                  {report["effect_over_noise"]:.4f}')
     log('PROBE', f'  extreme action pair             {report["extreme_effect"]:.4f} '

@@ -76,6 +76,16 @@ class DreamerConfig(Config):
         # right to spend it elsewhere; raising this buys flag accuracy with
         # continuous accuracy.
         self.obs_binary_loss_weight = 1.0
+        # Give those channels their own decoder branch, emitting logits scored
+        # with BCEWithLogitsLoss instead of sharing the regression head.  See
+        # agent/world_models/vq.py:_BinaryFlagHead and
+        # DreamerLearner._reconstruction_loss.  Off by default so DIMA's own
+        # environments and every checkpoint written before this are unaffected.
+        self.obs_binary_head = False
+        # Weight on the positive class of that loss.  A flag positive a fraction
+        # p of the time is balanced at (1 - p) / p; MATE-4v8-9 measures p = 0.136,
+        # so 6.0.
+        self.obs_binary_pos_weight = 6.0
 
         # What the actor's lambda-return is built from.
         #
@@ -102,6 +112,13 @@ class DreamerConfig(Config):
         ## denoiser params
         self.cond_channels = 256
 
+        # How the conditioning actions reach the denoiser: 'sequential' is DIMA's
+        # original masked, one-agent-per-denoising-step scheme, 'joint' feeds the
+        # whole joint action at every step.  See
+        # agent/world_models/perceiver.py:JointActionEmb.
+        self.action_cond = 'sequential'
+        self.agent_action_embed_dim = 64
+
         self.inner_model_cfg = StateInnerModelConfig(
             state_dim = -1,
             num_steps_conditioning = 3,
@@ -110,6 +127,8 @@ class DreamerConfig(Config):
             channels = [64, 64, 64],
             attn_depths = [0, 0, 0],
             action_dim = -1,
+            action_cond = self.action_cond,
+            agent_action_embed_dim = self.agent_action_embed_dim,
         )
 
         self.perceiver_cfg = PerceiverConfig(

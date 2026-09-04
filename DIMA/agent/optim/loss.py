@@ -178,14 +178,18 @@ def rollout_diffusion_world_models(training_buffer, running_mean_std, state_deco
 
         if config.compute_end_in_TD:
             # cprint('using reset in wm env', 'light_magenta')
-            obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions, _ = rollout_policy_with_env(wm_env, actor, critic, config.horizon)
+            obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions, infos = rollout_policy_with_env(wm_env, actor, critic, config.horizon)
         else:
             # cprint('Disable reset in wm env', 'light_blue')
-            obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions, _ = rollout_policy_with_env_wo_reset(wm_env, actor, critic, config.horizon)
+            obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions, infos = rollout_policy_with_env_wo_reset(wm_env, actor, critic, config.horizon)
         
         end = end.to(torch.float32)
         trunc = trunc.to(torch.float32)
 
+        # (batch, horizon, agents, obs_dim): next_obs[:, n] is what act[:, n] led
+        # to, which `obs` does not contain -- see the note in env_loop.
+        next_obs = torch.stack([info['next_obs'] for info in infos], dim=1).detach()
+
     del wm_env
 
-    return obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions
+    return obs, next_obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions

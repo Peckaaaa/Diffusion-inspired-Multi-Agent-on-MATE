@@ -110,15 +110,22 @@ class DreamerLearner:
             cprint(f"Using Option 2 state decoder: s_t + o_t-1 -> o_t.", "yellow", attrs=["bold"])
             tokenizer_in_dim = config.STATE_DIM + config.IN_DIM
 
+        # A separate decoder branch for the 0/1 flag channels, when the
+        # environment names them and the run asks for it.  See vq._BinaryFlagHead
+        # and _reconstruction_loss below.
+        decoder_binary_indices = (
+            config.obs_binary_indices if getattr(config, 'obs_binary_head', False) else None
+        )
         if config.vq_type == 'fsq':
             levels = [8, 6, 5]  # [8, 5, 5, 5]
             self.state_decoder = SimpleFSQAutoEncoder(in_dim=tokenizer_in_dim, num_tokens=config.nums_obs_token, output_dim=config.NUM_AGENTS * config.IN_DIM,
-                                                      levels=levels).to(config.DEVICE).eval()
+                                                      levels=levels, binary_indices=decoder_binary_indices).to(config.DEVICE).eval()
             self.obs_vocab_size = np.prod(levels)
 
         else:
             self.state_decoder = SimpleVQAutoEncoder(in_dim=tokenizer_in_dim, embed_dim=config.EMBED_DIM, num_tokens=config.nums_obs_token, output_dim=config.NUM_AGENTS * config.IN_DIM,
-                                                     codebook_size=config.OBS_VOCAB_SIZE, learnable_codebook=False, ema_update=True, decay=config.ema_decay).to(config.DEVICE).eval()
+                                                     codebook_size=config.OBS_VOCAB_SIZE, learnable_codebook=False, ema_update=True, decay=config.ema_decay,
+                                                     binary_indices=decoder_binary_indices).to(config.DEVICE).eval()
             self.obs_vocab_size = config.OBS_VOCAB_SIZE
 
         cprint(f"Using {config.rew_end_model_type}-based rew & end model.", "cyan", attrs=["bold"])
@@ -203,6 +210,7 @@ class DreamerLearner:
         print("")
 
         self._binary_index_tensor = None
+        self._binary_pos_weight = None
         self._continuous_index_tensor = None
 
         self.train_ac_only = False
@@ -608,15 +616,27 @@ class DreamerLearner:
 
     #### train state decoder
     def _reconstruction_loss(self, out, obs):
-        """Reconstruction loss for the state decoder.
+        """Reconstruction loss for the state decoder, split by channel type.
 
-        L1 everywhere, except on the channels ``config.obs_binary_indices`` names
-        as 0/1 flags: those get a squared error. L1's optimum is the conditional
-        median, which for a flag that is rarely 1 is exactly 0 -- the decoder then
-        predicts "never" for every flag and the prediction says nothing about how
-        likely it is. A squared error puts the optimum at the conditional mean,
-        which for a 0/1 variable *is* the probability, and so is directly
-        comparable against the 0.5 cut a reader applies to it.
+        Continuous channels keep DIMA's L1.  The channels
+        ``config.obs_binary_indices`` names as 0/1 flags are a classification
+        problem, not a regression one, and are scored as such.
+
+        Why not L1, and why not a squared error either
+        ----------------------------------------------
+        L1's optimum is the conditional *median*, which for a flag positive only
+        13.6% of the time is exactly 0: the decoder predicts "never" for every
+        flag and sighting recall stalls (measured: 0.25-0.31).  A squared error
+        moves the optimum to the conditional mean, but leaves the rare class
+        contributing 13.6% of the gradient, which was not enough to move it.
+
+        ``BCEWithLogitsLoss(pos_weight=obs_binary_pos_weight)`` scales the
+        positive term instead, so a missed sighting costs ``pos_weight`` times a
+        false one; the default 6.0 is the class ratio (1 - 0.136) / 0.136.  It
+        needs logits, which is what the decoder's flag branch emits from
+        ``forward`` (``vq._BinaryFlagHead``).  Without that branch -- a run with
+        ``obs_binary_head`` off, or a legacy checkpoint -- the flag channels are
+        still regression outputs, and the squared error is kept for them.
 
         Returns the total loss and its two parts, so a run can be watched for the
         flag block improving while the continuous block holds.
@@ -635,11 +655,19 @@ class DreamerLearner:
             mask[self._binary_index_tensor] = True
             self._continuous_index_tensor = torch.nonzero(~mask, as_tuple=False).squeeze(-1)
 
-        binary_loss = (
-            (out[..., self._binary_index_tensor] - obs[..., self._binary_index_tensor])
-            .square()
-            .mean()
-        )
+        predicted_flags = out[..., self._binary_index_tensor]
+        target_flags = obs[..., self._binary_index_tensor]
+        if getattr(self.state_decoder, 'binary_head', None) is not None:
+            if self._binary_pos_weight is None or self._binary_pos_weight.device != out.device:
+                self._binary_pos_weight = torch.tensor(
+                    float(getattr(self.config, 'obs_binary_pos_weight', 1.0)),
+                    device=out.device,
+                )
+            binary_loss = F.binary_cross_entropy_with_logits(
+                predicted_flags, target_flags, pos_weight=self._binary_pos_weight
+            )
+        else:
+            binary_loss = (predicted_flags - target_flags).square().mean()
         continuous_loss = (
             (out[..., self._continuous_index_tensor] - obs[..., self._continuous_index_tensor])
             .abs()
@@ -755,31 +783,30 @@ class DreamerLearner:
         sample = self._to_device(sample)
         self.model.visualize_attn(sample, self.tokenizer, save_path)
     
-    def imagined_coverage(self, obs):
+    def imagined_coverage(self, next_obs):
         """Fraction of opponents at least one agent observes, per imagined step.
 
-        ``obs`` is ``(batch, horizon, agents, obs_dim)`` in the model's own
-        observation scale.  The presence flags are 0/1 in that scale as well --
-        the environment does not rescale them -- so they can be read directly and
-        the whole thing stays one gather and two reductions, which matters because
-        this runs on every actor-critic update.
+        ``next_obs`` is ``(batch, horizon, agents, obs_dim)``: the observation the
+        step's action *led to*, decoded from the state the diffusion sampler
+        produced from that action.  It is not the rollout's ``obs``, which is what
+        the policy acted on and is therefore settled before the action is taken --
+        scoring that would make the reward independent of the action it is meant
+        to grade.  ``rollout_diffusion_world_models`` returns both.
+
+        The presence flags leave the decoder as probabilities in [0, 1]
+        (``vq._BinaryFlagHead``: ``encode_decode`` applies the sigmoid), and MATE
+        rescales a 0/1 flag to itself, so the 0.5 cut is applied directly.  The
+        whole thing stays one gather and two reductions, which matters because it
+        runs on every actor-critic update.
 
         Returns ``(batch, horizon)`` in ``[0, 1]``.
         """
 
         indices = torch.as_tensor(
-            self.config.imagined_coverage_indices, dtype=torch.long, device=obs.device
+            self.config.imagined_coverage_indices, dtype=torch.long, device=next_obs.device
         )
-        sighted = obs.index_select(-1, indices) > 0.5      # (b, h, agents, targets)
-        coverage = sighted.any(dim=-2).to(obs.dtype).mean(dim=-1)   # (b, h)
-
-        # The rollout stores obs[:, n] as the observation the policy *acted on*, so
-        # coverage(obs[:, n]) does not depend on action n at all -- it is already
-        # settled before the action is taken.  The reward for acting at step n is
-        # the coverage of where that action leads, so the series is shifted by one.
-        # The final step has no successor inside the horizon and keeps its own
-        # value, which biases one step out of `horizon` rather than losing it.
-        return torch.cat([coverage[:, 1:], coverage[:, -1:]], dim=1)
+        sighted = next_obs.index_select(-1, indices) > 0.5      # (b, h, agents, targets)
+        return sighted.any(dim=-2).to(next_obs.dtype).mean(dim=-1)   # (b, h)
 
     def train_agent(self, ):
         log_metrics = {}
@@ -791,7 +818,7 @@ class DreamerLearner:
         # obs: (batch_size, horizon, num_agents, obs_dim)
         # shared_obs: (batch_size, horizon, state_dim)
         # act: (batch_size, horizon, num_agents, act_dim)
-        obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions \
+        obs, next_obs, shared_obs, act, rew, pcont, end, trunc, logits_act, val, val_bootstrap, av_actions \
             = rollout_diffusion_world_models(self.replay_buffer, self.state_rms, self.state_decoder, self.denoiser, self.rew_end_model,
                                              self.actor, self.critic, self.config, env_type=self.env_type)
 
@@ -808,7 +835,7 @@ class DreamerLearner:
                     'imagined_reward=coverage reads one observation per step, but '
                     'use_stack concatenates several into each.'
                 )
-            rew = self.imagined_coverage(obs).reshape(rew.shape).to(rew.dtype)
+            rew = self.imagined_coverage(next_obs).reshape(rew.shape).to(rew.dtype)
 
         if self.use_valuenorm:
             val_shape = val_bootstrap.shape

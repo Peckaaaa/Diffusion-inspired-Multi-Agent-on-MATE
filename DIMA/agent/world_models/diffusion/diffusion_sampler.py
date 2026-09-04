@@ -33,6 +33,10 @@ class DiffusionSampler:
         
         self.sigmas = build_sigmas(cfg.num_steps_denoising, cfg.sigma_min, cfg.sigma_max, cfg.rho, denoiser.device)
 
+    @property
+    def uses_joint_action_cond(self) -> bool:
+        return self.denoiser.uses_joint_action_cond
+
     @torch.no_grad()
     def encode(self, state):
         return self.denoiser.encode(state)
@@ -103,16 +107,24 @@ class DiffusionSampler:
             x = x0.to(device=device, dtype=prev_state.dtype)
         trajectory = [x]
 
-        # implement sequential causal graph
         num_agents = self.denoiser.num_agents
-        agent_order = self.sample_agent_order(num_agents, self.cfg.agent_order)
+        joint_cond = self.uses_joint_action_cond
 
-        if self.cfg.num_steps_denoising != len(agent_order):
-            # 'tiled' already returns the full sequence; the others name one agent
-            # per band and are stretched to fill the schedule.
-            agent_order = torch.repeat_interleave(
-                agent_order, repeats=self.cfg.num_steps_denoising // len(agent_order)
-            )
+        if joint_cond:
+            # Every step sees the whole joint action, so there is no agent order
+            # to sample and no reason for num_steps_denoising to divide by the
+            # agent count: the schedule and the team size are now independent.
+            agent_order = None
+        else:
+            # implement sequential causal graph
+            agent_order = self.sample_agent_order(num_agents, self.cfg.agent_order)
+
+            if self.cfg.num_steps_denoising != len(agent_order):
+                # 'tiled' already returns the full sequence; the others name one agent
+                # per band and are stretched to fill the schedule.
+                agent_order = torch.repeat_interleave(
+                    agent_order, repeats=self.cfg.num_steps_denoising // len(agent_order)
+                )
             
         # 每一个sigma就是一个denoising step
         for idx, (sigma, next_sigma) in enumerate(zip(self.sigmas[:-1], self.sigmas[1:])):
@@ -123,7 +135,8 @@ class DiffusionSampler:
                 x = x + eps * (sigma_hat**2 - sigma**2) ** 0.5
 
             act_mask = torch.ones(*prev_act.shape[:3], device=device, dtype=torch.long)
-            act_mask[:, -1] = F.one_hot(agent_order[idx], num_classes=num_agents).expand(act_mask.size(0), -1)
+            if not joint_cond:
+                act_mask[:, -1] = F.one_hot(agent_order[idx], num_classes=num_agents).expand(act_mask.size(0), -1)
 
             denoised = self.denoiser.denoise(x, sigma, prev_state, prev_act, act_mask)
             d = (x - denoised) / sigma_hat

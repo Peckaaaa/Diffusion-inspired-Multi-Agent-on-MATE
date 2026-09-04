@@ -149,6 +149,9 @@ def train(
     denoiser_batch_size: Optional[int] = None,
     rew_end_batch_size: Optional[int] = None,
     obs_binary_loss_weight: Optional[float] = None,
+    obs_binary_pos_weight: Optional[float] = None,
+    obs_binary_head: Optional[bool] = None,
+    action_conditioning: Optional[str] = None,
     nums_obs_token: Optional[int] = None,
     obs_vocab_size: Optional[int] = None,
     num_steps_denoising: Optional[int] = None,
@@ -198,6 +201,12 @@ def train(
         overrides['rew_end_batch_size'] = int(rew_end_batch_size)
     if obs_binary_loss_weight is not None:
         overrides['obs_binary_loss_weight'] = float(obs_binary_loss_weight)
+    if obs_binary_pos_weight is not None:
+        overrides['obs_binary_pos_weight'] = float(obs_binary_pos_weight)
+    if obs_binary_head is not None:
+        overrides['obs_binary_head'] = bool(obs_binary_head)
+    if action_conditioning is not None:
+        overrides['action_cond'] = str(action_conditioning)
     if nums_obs_token is not None:
         overrides['nums_obs_token'] = int(nums_obs_token)
     if obs_vocab_size is not None:
@@ -333,7 +342,10 @@ def train(
             'WM',
             f'sampler: num_steps_denoising={config.diffusion_sampler_cfg.num_steps_denoising} '
             f'agent_order={config.diffusion_sampler_cfg.agent_order!r} '
+            f'action_cond={config.denoiser_cfg.inner_model.action_cond!r} '
+            f'binary_head={config.obs_binary_head} '
             f'binary_loss_weight={config.obs_binary_loss_weight} '
+            f'binary_pos_weight={config.obs_binary_pos_weight} '
             f'imagined_reward={config.imagined_reward!r} '
             f'entropy={config.ENTROPY}',
         )
@@ -582,9 +594,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--obs-vocab-size', type=int, default=None,
                         help='VQ codebook size (default 128); the decoder bottleneck is '
                              'nums_obs_token * log2(obs_vocab_size) bits')
-    parser.add_argument('--num-steps-denoising', type=int, default=None,
+    parser.add_argument('--num-steps-denoising', '--num-denoising-steps', type=int, default=None,
+                        dest='num_steps_denoising',
                         help='diffusion steps per transition; must be a multiple of the agent '
                              'count (default: one step per agent)')
+    parser.add_argument('--action-conditioning', default=None, choices=['joint', 'sequential'],
+                        help="how the conditioning actions reach the denoiser: 'joint' feeds all "
+                             "agents' actions to every denoising step (default for MATE), "
+                             "'sequential' is DIMA's masked one-agent-per-step scheme, under which "
+                             'the last-step agent held 10x the influence of the first')
+    parser.add_argument('--obs-binary-pos-weight', type=float, default=None,
+                        help='positive-class weight of the flag BCE loss (default 6.0, the '
+                             '(1-p)/p ratio at the measured 13.6%% positive rate)')
+    parser.add_argument('--no-obs-binary-head', action='store_true',
+                        help='score the 0/1 flags with the shared regression head instead of '
+                             'their own branch (the pre-fix behaviour; for ablation)')
     parser.add_argument('--agent-order', default=None,
                         choices=['default', 'reverse', 'random', 'tiled'],
                         help="order actions condition the denoising steps in; 'tiled' gives every "
@@ -623,6 +647,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         denoiser_batch_size=args.denoiser_batch_size,
         rew_end_batch_size=args.rew_end_batch_size,
         obs_binary_loss_weight=args.obs_binary_loss_weight,
+        obs_binary_pos_weight=args.obs_binary_pos_weight,
+        obs_binary_head=False if args.no_obs_binary_head else None,
+        action_conditioning=args.action_conditioning,
         nums_obs_token=args.nums_obs_token,
         obs_vocab_size=args.obs_vocab_size,
         num_steps_denoising=args.num_steps_denoising,

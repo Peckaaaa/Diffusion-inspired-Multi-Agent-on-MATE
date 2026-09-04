@@ -509,7 +509,10 @@ class DIMAWorldModel(WorldModel):
         info.update(
             checkpoint=self.checkpoint_path,
             num_steps_denoising=int(self.config.diffusion_sampler_cfg.num_steps_denoising),
+            action_cond=str(self.config.denoiser_cfg.inner_model.action_cond),
+            # Only meaningful under sequential conditioning; joint ignores it.
             agent_order=str(self.config.diffusion_sampler_cfg.agent_order),
+            obs_binary_head=bool(getattr(self.config, 'obs_binary_head', False)),
             vq_type=str(self.config.vq_type),
             num_samples=self.num_samples,
             device=str(self.device),

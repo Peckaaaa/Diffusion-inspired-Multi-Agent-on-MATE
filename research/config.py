@@ -255,6 +255,28 @@ class _MATEConfigMixin:
         self.ACTION_SPACE = None
         self.policy_class = 'discrete'
 
+        # The 21 flags per camera (8 opponent + 9 obstacle + 4 teammate masks) are
+        # 0/1 classification targets, positive 13.6% of the time.  Sharing the
+        # decoder's regression head with 105 continuous channels pinned them at 0
+        # and held sighting recall at 0.25-0.31, so they get their own head and a
+        # class-weighted BCE.  See DreamerLearner._reconstruction_loss.
+        self.obs_binary_head = True
+        self.obs_binary_loss_weight = 6.0
+        self.obs_binary_pos_weight = 6.0
+
+        # Feed the whole joint action to every denoising step.  Under DIMA's
+        # sequential-causal scheme the camera assigned to the last, lowest-sigma
+        # step held ten times the influence of the first (measured with common
+        # random numbers on MATE-4v8-9: 0.1029 vs 0.0106), which is a property of
+        # the denoising schedule rather than of the environment.  See
+        # agent/world_models/perceiver.py:JointActionEmb.
+        # StateInnerModelConfig was built from DreamerConfig's own default before
+        # this mixin ran, so the nested copy has to be set too -- it is the one
+        # InnerModel reads.
+        self.denoiser_cfg.inner_model.action_cond = 'joint'
+        self.action_cond = 'joint'
+        self.agent_action_embed_dim = self.denoiser_cfg.inner_model.agent_action_embed_dim
+
         # "s + id": the state decoder maps the global state plus an agent id to
         # that agent's observation.  Option 2 ("s + last_obs") would make the
         # decoder input depend on the previous observation, which the closed-loop
@@ -318,6 +340,10 @@ CHECKPOINT_CONFIG_FIELDS = (
     'HEADS',
     'state_decoder_type',
     'use_ce_for_cont',
+    # Builds a second decoder branch, so it changes the state dict.
+    'obs_binary_head',
+    'obs_binary_pos_weight',
+    'obs_binary_loss_weight',
 )
 
 CHECKPOINT_CONFIG_FILENAME = 'config.json'
@@ -337,6 +363,12 @@ def export_checkpoint_config(config, path) -> 'Path':
     payload['agent_order'] = str(config.diffusion_sampler_cfg.agent_order)
     payload['num_steps_conditioning'] = int(
         config.denoiser_cfg.inner_model.num_steps_conditioning
+    )
+    # Nested on the inner model, and shape-determining: 'joint' builds one action
+    # embedding table per agent plus an MLP, 'sequential' builds a Perceiver.
+    payload['action_cond'] = str(config.denoiser_cfg.inner_model.action_cond)
+    payload['agent_action_embed_dim'] = int(
+        config.denoiser_cfg.inner_model.agent_action_embed_dim
     )
 
     destination = _Path(path)
@@ -373,7 +405,39 @@ def apply_checkpoint_config(config, checkpoint_path) -> Optional[Dict[str, Any]]
         config.diffusion_sampler_cfg.num_steps_denoising = int(payload['num_steps_denoising'])
     if payload.get('agent_order'):
         config.diffusion_sampler_cfg.agent_order = str(payload['agent_order'])
+
+    # A sidecar written before joint conditioning existed describes a checkpoint
+    # that was necessarily trained with the sequential encoder, so its absence is
+    # informative rather than unknown: defaulting to the *current* default would
+    # rebuild the wrong module and fail with `size mismatch`.  Same reasoning for
+    # the decoder's flag branch.
+    apply_action_cond(config, payload.get('action_cond', 'sequential'))
+    if 'agent_action_embed_dim' in payload:
+        config.denoiser_cfg.inner_model.agent_action_embed_dim = int(
+            payload['agent_action_embed_dim']
+        )
+        config.agent_action_embed_dim = int(payload['agent_action_embed_dim'])
+    if 'obs_binary_head' not in payload:
+        config.obs_binary_head = False
     return payload
+
+
+def apply_action_cond(config, action_cond: str) -> None:
+    """Set the denoiser's action-conditioning scheme, nested cfg and flat mirror.
+
+    ``config.action_cond`` is what ``config.to_dict()`` and every log line read;
+    ``config.denoiser_cfg.inner_model.action_cond`` is what ``InnerModel`` reads.
+    They are separate objects, so setting only the first silently builds the other
+    encoder.
+    """
+
+    action_cond = str(action_cond)
+    if action_cond not in ('sequential', 'joint'):
+        raise ValueError(
+            f"action_cond must be 'sequential' or 'joint', got {action_cond!r}."
+        )
+    config.action_cond = action_cond
+    config.denoiser_cfg.inner_model.action_cond = action_cond
 
 
 def _jsonable(value):
@@ -435,12 +499,22 @@ def build_learner_config(
         config.worldmodel_env_cfg.horizon = config.horizon
         config.trans_config.max_blocks = config.horizon
 
-    # DIMA/train.py:212-213 -- the diffusion sampler denoises one agent's action
-    # per step, so the number of denoising steps must be a multiple of the number
-    # of agents (DiffusionSampler.sample_agent_order asserts this).
+    # DIMA/train.py:212-213 -- one denoising step per agent.  Under joint
+    # conditioning the schedule no longer encodes the agent order, so this is only
+    # the default number of steps, not a constraint; --num-denoising-steps
+    # overrides it freely.
     config.diffusion_sampler_cfg.num_steps_denoising = (
         config.NUM_AGENTS if config.NUM_AGENTS > 2 else config.NUM_AGENTS * 2
     )
+
+    # Applied before the divisibility check below, which only binds for the
+    # sequential encoder.
+    if overrides and 'action_cond' in overrides:
+        apply_action_cond(config, overrides.pop('action_cond'))
+    if overrides and 'agent_action_embed_dim' in overrides:
+        width = int(overrides.pop('agent_action_embed_dim'))
+        config.denoiser_cfg.inner_model.agent_action_embed_dim = width
+        config.agent_action_embed_dim = width
 
     # Sampler knobs are reachable through `overrides` under these names, because
     # they live on a nested dataclass that the flat override loop below cannot
@@ -458,10 +532,14 @@ def build_learner_config(
             int(value) if key == 'num_steps_denoising' else str(value),
         )
     steps = config.diffusion_sampler_cfg.num_steps_denoising
-    if steps % config.NUM_AGENTS:
+    if steps < 1:
+        raise ValueError(f'num_steps_denoising={steps} must be at least 1.')
+    if config.denoiser_cfg.inner_model.action_cond != 'joint' and steps % config.NUM_AGENTS:
         raise ValueError(
             f'num_steps_denoising={steps} must be a multiple of the {config.NUM_AGENTS} '
-            f'agents; DiffusionSampler.sample_agent_order asserts this.'
+            f'agents under sequential action conditioning; '
+            f'DiffusionSampler.sample_agent_order asserts this. '
+            f'Joint conditioning (--action-conditioning joint) removes the constraint.'
         )
 
     if device is not None:

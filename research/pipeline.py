@@ -89,6 +89,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         denoiser_steps_first_epoch=4,
         remodel_steps=4,
         obs_binary_loss_weight=None,
+        obs_binary_pos_weight=None,
+        action_conditioning=None,
         nums_obs_token=None,
         obs_vocab_size=None,
         num_steps_denoising=None,
@@ -122,6 +124,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         denoiser_batch_size=None,
         rew_end_batch_size=None,
         obs_binary_loss_weight=None,
+        obs_binary_pos_weight=None,
+        action_conditioning=None,
         nums_obs_token=None,
         obs_vocab_size=None,
         num_steps_denoising=None,
@@ -149,6 +153,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         denoiser_batch_size=None,
         rew_end_batch_size=None,
         obs_binary_loss_weight=None,
+        obs_binary_pos_weight=None,
+        action_conditioning=None,
         nums_obs_token=None,
         obs_vocab_size=None,
         num_steps_denoising=None,
@@ -183,6 +189,8 @@ _OVERRIDE_FIELDS = (
     'denoiser_batch_size',
     'rew_end_batch_size',
     'obs_binary_loss_weight',
+    'obs_binary_pos_weight',
+    'action_conditioning',
     'nums_obs_token',
     'obs_vocab_size',
     'num_steps_denoising',
@@ -496,6 +504,8 @@ def run_pipeline(
                 obs_binary_loss_weight=size['obs_binary_loss_weight'],
                 nums_obs_token=size['nums_obs_token'],
                 obs_vocab_size=size['obs_vocab_size'],
+                obs_binary_pos_weight=size['obs_binary_pos_weight'],
+                action_conditioning=size['action_conditioning'],
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
                 entropy=size['entropy'],
@@ -537,6 +547,8 @@ def run_pipeline(
                 obs_binary_loss_weight=size['obs_binary_loss_weight'],
                 nums_obs_token=size['nums_obs_token'],
                 obs_vocab_size=size['obs_vocab_size'],
+                obs_binary_pos_weight=size['obs_binary_pos_weight'],
+                action_conditioning=size['action_conditioning'],
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
                 entropy=size['entropy'],
@@ -647,18 +659,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     sizes.add_argument('--rew-end-batch-size', type=int, default=None)
     sizes.add_argument('--obs-binary-loss-weight', type=float, default=None,
                        help='weight on the 0/1 flag block of the state decoder loss (default 1.0)')
+    sizes.add_argument('--obs-binary-pos-weight', type=float, default=None,
+                       help='positive-class weight of the flag BCE loss (default 6.0)')
+    sizes.add_argument('--action-conditioning', default=None, choices=['joint', 'sequential'],
+                       help="'joint' feeds every agent's action to every denoising step "
+                            "(default); 'sequential' is DIMA's masked scheme, under which the "
+                            'last-step agent held 10x the influence of the first')
     sizes.add_argument('--nums-obs-token', type=int, default=None,
                        help='VQ tokens the state is compressed into (default 12)')
     sizes.add_argument('--obs-vocab-size', type=int, default=None,
                        help='VQ codebook size (default 128)')
-    sizes.add_argument('--num-steps-denoising', type=int, default=None,
-                       help='diffusion steps per transition; must be a multiple of the agent count')
+    sizes.add_argument('--num-steps-denoising', '--num-denoising-steps', type=int, default=None,
+                       dest='num_steps_denoising',
+                       help='diffusion steps per transition (default: one per agent); free under '
+                            'joint action conditioning, a multiple of the agent count under '
+                            'sequential')
     sizes.add_argument('--agent-order', default=None,
                        choices=['default', 'reverse', 'random', 'tiled'],
                        help="'tiled' gives every agent a low-sigma slot instead of one band each")
     sizes.add_argument('--imagined-reward', default=None, choices=['model', 'coverage'],
                        help="what the actor's lambda-return is built from; 'coverage' replaces "
-                            "DIMA's reward head, which moves 1% of its spread when the action "
+                            "DIMA's reward head, which moves 1%% of its spread when the action "
                             'changes, with the imagined coverage rate')
     sizes.add_argument('--entropy', type=float, default=None,
                        help="actor entropy coefficient (default 0.001, inherited from DIMA's SMAC "

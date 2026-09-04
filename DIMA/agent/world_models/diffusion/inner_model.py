@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ..blocks import Conv3x3, FourierFeatures, GroupNorm, UNet
 from ..temporal_unet import UNet1D, Conv3x1
-from ..perceiver import SequentialActionEmb, PerceiverConfig
+from ..perceiver import JointActionEmb, SequentialActionEmb, PerceiverConfig
 
 
 @dataclass
@@ -33,6 +33,16 @@ class StateInnerModelConfig:
     action_dim: Optional[int] = None
     dim: int = 128
     dim_mults: Tuple[int] =(1, 4, 8)
+    #: How the conditioning actions reach the denoiser.
+    #:
+    #: ``'sequential'`` is DIMA's original sequential-causal encoder: the sampler
+    #: exposes one agent's action per denoising step through ``act_mask``.
+    #: ``'joint'`` feeds every agent's action at every step, so influence is not a
+    #: function of which denoising step an agent was assigned -- see
+    #: ``JointActionEmb`` for the measurement that motivates it.
+    action_cond: str = 'sequential'
+    #: Width of the per-agent action embedding used by ``'joint'``.
+    agent_action_embed_dim: int = 64
     
 class InnerModel(nn.Module):
     def __init__(self, cfg: StateInnerModelConfig,
@@ -43,14 +53,29 @@ class InnerModel(nn.Module):
         self.noise_emb = FourierFeatures(cfg.cond_channels)
         self.is_continuous_act = is_continuous_act
 
-        # No matter whether continuous action or discrete action, using Perceiver as action_emb
-        self.act_emb = SequentialActionEmb(
-            num_agents=num_agents,
-            num_steps_conditioning=cfg.num_steps_conditioning,
-            action_dim=cfg.action_dim,
-            is_continuous_act=is_continuous_act,
-            perceiver_cfg=perceiver_cfg,
-        )
+        self.action_cond = getattr(cfg, 'action_cond', 'sequential')
+        if self.action_cond == 'joint':
+            self.act_emb = JointActionEmb(
+                num_agents=num_agents,
+                num_steps_conditioning=cfg.num_steps_conditioning,
+                action_dim=cfg.action_dim,
+                is_continuous_act=is_continuous_act,
+                output_dim=perceiver_cfg.output_dim,
+                agent_embed_dim=getattr(cfg, 'agent_action_embed_dim', 64),
+            )
+        elif self.action_cond == 'sequential':
+            # No matter whether continuous action or discrete action, using Perceiver as action_emb
+            self.act_emb = SequentialActionEmb(
+                num_agents=num_agents,
+                num_steps_conditioning=cfg.num_steps_conditioning,
+                action_dim=cfg.action_dim,
+                is_continuous_act=is_continuous_act,
+                perceiver_cfg=perceiver_cfg,
+            )
+        else:
+            raise ValueError(
+                f"action_cond must be 'sequential' or 'joint', got {self.action_cond!r}."
+            )
 
         self.cond_proj = nn.Sequential(
             nn.Linear(cfg.cond_channels, cfg.cond_channels),
