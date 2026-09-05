@@ -1,19 +1,21 @@
-"""Locate the external MATE checkout and its scenario files.
+"""Locate the MATE checkout and its scenario files.
 
-This repository holds the world model only.  The simulator, the scenario YAMLs,
-the wrappers and the builtin target agents all live in ``MATE-main``; nothing is
-vendored here.
+``src/`` holds the world model only.  The simulator, the scenario YAMLs, the
+wrappers and the builtin target agents all come from ``MATE-main`` -- whether
+that sits inside the repository or beside it.
 """
 
 import os
 import sys
 
-_WORKSPACE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PARENT = os.path.dirname(_REPO)
 
 # Searched in order; the first directory that actually holds a ``mate`` package wins.
 _CANDIDATE_ROOTS = (
-    os.path.join(_WORKSPACE, 'MATE-main'),
-    os.path.join(_WORKSPACE, 'MATE', 'MATE-main'),
+    os.path.join(_REPO, 'MATE-main'),
+    os.path.join(_PARENT, 'MATE-main'),
+    os.path.join(_PARENT, 'MATE', 'MATE-main'),
 )
 
 

@@ -7,23 +7,26 @@ Four stages per iteration:
   3. imagine H steps through the categorical reverse process
   4. update communicative MAPPO on the imagined trajectories
 
-The environment itself lives outside this repository: ``envs/config_resolver.py``
-imports ``mate`` from the MATE-main checkout (``MATE_ROOT``, default
-``../MATE/MATE-main``).
+``src/envs/config_resolver.py`` imports ``mate`` from the MATE-main checkout it
+finds next to (or inside) the repository; ``MATE_ROOT`` overrides that search.
 
 Run:
-    python train.py --config configs/default.yaml --set train.device=cpu
+    python train.py --config src/configs/default.yaml --set train.device=cpu
 """
 
 import argparse
 import copy
 import os
+import sys
 import time
 from collections import defaultdict
 
 import numpy as np
 import torch
 import yaml
+
+# The packages live under src/; the entrypoints stay at the repository root.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
 from algorithms.communicative_mappo import CommunicativeMAPPO
 from algorithms.replay_buffer import ReplayBuffer
@@ -57,7 +60,11 @@ def load_config(path, overrides=()):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'configs', 'default.yaml'),
+    )
     parser.add_argument(
         '--set',
         dest='overrides',
