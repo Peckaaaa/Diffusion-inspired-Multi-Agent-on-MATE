@@ -274,6 +274,16 @@ class _MATEConfigMixin:
         # this mixin ran, so the nested copy has to be set too -- it is the one
         # InnerModel reads.
         self.denoiser_cfg.inner_model.action_cond = 'joint'
+        # DIMA's 0.001 comes from a SMAC config and collapses a 25-action policy;
+        # 0.05 went the other way -- measured on MATE-4v8-9 the policy sat at
+        # act_entropy 3.14 of a possible 3.22 for 140 episodes, i.e. uniform, and
+        # the coverage it collected fell to 0.07 while the world model improved.
+        # 0.005 with a schedule down to 0.001 keeps early exploration without
+        # standing on the lambda-return for the whole run.
+        self.ENTROPY = 0.005
+        self.ENTROPY_FINAL = 0.001
+        self.ENTROPY_ANNEAL_ROUNDS = 200
+
         self.action_cond = 'joint'
         self.agent_action_embed_dim = self.denoiser_cfg.inner_model.agent_action_embed_dim
 

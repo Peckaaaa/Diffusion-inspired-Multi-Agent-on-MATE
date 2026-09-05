@@ -96,6 +96,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         num_steps_denoising=None,
         agent_order=None,
         entropy=None,
+        entropy_final=None,
+        entropy_anneal_rounds=None,
         imagined_reward=None,
         sensitivity_samples=2,
         # DIMA's original batch sizes: the raised defaults would demand a bigger
@@ -131,6 +133,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         num_steps_denoising=None,
         agent_order=None,
         entropy=None,
+        entropy_final=None,
+        entropy_anneal_rounds=None,
         imagined_reward=None,
         sensitivity_samples=4,
         eval_episodes=10,
@@ -160,6 +164,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         num_steps_denoising=None,
         agent_order=None,
         entropy=None,
+        entropy_final=None,
+        entropy_anneal_rounds=None,
         imagined_reward=None,
         sensitivity_samples=8,
         # 10 x 150 is the protocol the README's published baseline matrix used, so
@@ -196,6 +202,8 @@ _OVERRIDE_FIELDS = (
     'num_steps_denoising',
     'agent_order',
     'entropy',
+    'entropy_final',
+    'entropy_anneal_rounds',
     'imagined_reward',
     'sensitivity_samples',
     'eval_episodes',
@@ -513,6 +521,8 @@ def run_pipeline(
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
                 entropy=size['entropy'],
+                entropy_final=size['entropy_final'],
+                entropy_anneal_rounds=size['entropy_anneal_rounds'],
                 imagined_reward=size['imagined_reward'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
@@ -556,6 +566,8 @@ def run_pipeline(
                 num_steps_denoising=size['num_steps_denoising'],
                 agent_order=size['agent_order'],
                 entropy=size['entropy'],
+                entropy_final=size['entropy_final'],
+                entropy_anneal_rounds=size['entropy_anneal_rounds'],
                 imagined_reward=size['imagined_reward'],
                 val_episodes=size['val_episodes'],
                 sensitivity_samples=size['sensitivity_samples'],
@@ -685,6 +697,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                        help="what the actor's lambda-return is built from; 'coverage' replaces "
                             "DIMA's reward head, which moves 1%% of its spread when the action "
                             'changes, with the imagined coverage rate')
+    sizes.add_argument('--entropy-final', type=float, default=None,
+                       help='anneal the entropy coefficient to this value over '
+                            '--entropy-anneal-rounds training rounds (MATE default 0.001)')
+    sizes.add_argument('--entropy-anneal-rounds', type=int, default=None,
+                       help='training rounds the entropy schedule spans (default 200)')
     sizes.add_argument('--entropy', type=float, default=None,
                        help="actor entropy coefficient (default 0.001, inherited from DIMA's SMAC "
                             'config; too small to stop a 25-action policy collapsing)')

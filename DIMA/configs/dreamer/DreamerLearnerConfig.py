@@ -36,6 +36,19 @@ class DreamerLearnerConfig(DreamerConfig):
         self.GRAD_CLIP = 100.0
         self.ENTROPY = 0.001 # 0.001  # with larger 0.01, we can obtain a little bit better performance on 2m_vs_1z
         self.ENTROPY_ANNEALING = 0.99998  # 1.0
+        # Linear entropy schedule over training ROUNDS, as an alternative to the
+        # per-minibatch geometric decay above.  That one multiplies by 0.99998 per
+        # optimizer step, which on this configuration is 25 steps per training
+        # round: 0.9995 per round, and 1386 rounds to halve.  Over a run that does
+        # a few hundred rounds it does not move at all, so a coefficient chosen
+        # high enough to keep the policy exploring early stays high enough to keep
+        # it from ever converging.
+        #
+        # When ENTROPY_FINAL is set, train_agent recomputes self.entropy from
+        # train_count each round and the geometric decay becomes irrelevant (it is
+        # overwritten before it is used).  Left None, nothing changes.
+        self.ENTROPY_FINAL = None
+        self.ENTROPY_ANNEAL_ROUNDS = 200
         self.GRAD_CLIP_POLICY = 10.0        # 100.0
 
         self.sample_temperature = 'inf'

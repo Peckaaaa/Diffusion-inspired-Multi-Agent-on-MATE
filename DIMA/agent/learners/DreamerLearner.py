@@ -808,8 +808,30 @@ class DreamerLearner:
         sighted = next_obs.index_select(-1, indices) > 0.5      # (b, h, agents, targets)
         return sighted.any(dim=-2).to(next_obs.dtype).mean(dim=-1)   # (b, h)
 
+    def _scheduled_entropy(self):
+        """Entropy coefficient for this training round, when a schedule is set.
+
+        Linear from ``ENTROPY`` to ``ENTROPY_FINAL`` across ``ENTROPY_ANNEAL_ROUNDS``
+        training rounds, then held at the floor.  Driven by ``train_count`` rather
+        than by optimizer steps so the schedule is legible in the run log and
+        survives a resume (``train_count`` is a checkpoint counter).
+        """
+
+        final = getattr(self.config, 'ENTROPY_FINAL', None)
+        if final is None:
+            return None
+        rounds = max(1, int(getattr(self.config, 'ENTROPY_ANNEAL_ROUNDS', 200)))
+        start = float(self.config.ENTROPY)
+        progress = min(1.0, max(0.0, self.train_count / rounds))
+        return start + (float(final) - start) * progress
+
     def train_agent(self, ):
         log_metrics = {}
+
+        scheduled = self._scheduled_entropy()
+        if scheduled is not None:
+            self.entropy = scheduled
+        log_metrics['Agent/entropy_coef'] = self.entropy
 
         self.state_decoder.eval()
         self.denoiser.eval()

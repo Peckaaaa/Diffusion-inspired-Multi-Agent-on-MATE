@@ -114,6 +114,8 @@ def train(
     num_steps_denoising: Optional[int] = None,
     agent_order: Optional[str] = None,
     entropy: Optional[float] = None,
+    entropy_final: Optional[float] = None,
+    entropy_anneal_rounds: Optional[int] = None,
     imagined_reward: Optional[str] = None,
     save_every: int = 25,
     val_episodes: int = 20,
@@ -172,6 +174,10 @@ def train(
         overrides['agent_order'] = str(agent_order)
     if entropy is not None:
         overrides['ENTROPY'] = float(entropy)
+    if entropy_final is not None:
+        overrides['ENTROPY_FINAL'] = float(entropy_final)
+    if entropy_anneal_rounds is not None:
+        overrides['ENTROPY_ANNEAL_ROUNDS'] = int(entropy_anneal_rounds)
     if imagined_reward is not None:
         overrides['imagined_reward'] = str(imagined_reward)
 
@@ -272,7 +278,8 @@ def train(
             f'binary_loss_weight={config.obs_binary_loss_weight} '
             f'binary_pos_weight={config.obs_binary_pos_weight} '
             f'imagined_reward={config.imagined_reward!r} '
-            f'entropy={config.ENTROPY}',
+            f'entropy={config.ENTROPY}->{config.ENTROPY_FINAL} '
+            f'over {config.ENTROPY_ANNEAL_ROUNDS} rounds',
         )
 
         checkpoint = run_dir / 'ckpt' / 'model_final.pth'
@@ -566,6 +573,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         choices=['default', 'reverse', 'random', 'tiled'],
                         help="order actions condition the denoising steps in; 'tiled' gives every "
                              'agent a low-sigma slot instead of one sigma band each')
+    parser.add_argument('--entropy-final', type=float, default=None,
+                        help='anneal the entropy coefficient linearly to this value over '
+                             '--entropy-anneal-rounds training rounds (MATE default 0.001). '
+                             "DIMA's own ENTROPY_ANNEALING needs 1386 rounds to halve, so it "
+                             'does not move within a run')
+    parser.add_argument('--entropy-anneal-rounds', type=int, default=None,
+                        help='training rounds the entropy schedule spans (default 200)')
     parser.add_argument('--entropy', type=float, default=None,
                         help="actor entropy coefficient (DIMA's default 0.001 comes from SMAC; a "
                              '25-action discrete policy collapses to one action at that value)')
@@ -610,6 +624,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         num_steps_denoising=args.num_steps_denoising,
         agent_order=args.agent_order,
         entropy=args.entropy,
+        entropy_final=args.entropy_final,
+        entropy_anneal_rounds=args.entropy_anneal_rounds,
         imagined_reward=args.imagined_reward,
         save_every=args.save_every,
         val_episodes=args.val_episodes,
