@@ -1,107 +1,28 @@
 # =============================================================================
-# DIMA x MATE -- unified requirements
+# FSQ world model for MATE -- requirements
 #
-# One environment runs both halves of this repository.  Every version below was
-# read back from the interpreter this integration was verified on; they are not
-# guesses.  Direct dependencies only -- pip resolves the transitive ones.
+# This repository holds the world model and the policy only.  The environment
+# (simulator, scenario YAMLs, wrappers, builtin target agents) is imported from
+# the external MATE-main checkout, which envs/config_resolver.py puts on
+# sys.path.  It looks for ../MATE-main then ../MATE/MATE-main; MATE_ROOT
+# overrides the search.
 #
-#   Python 3.10.21
+# Verified on the `mate` conda env:
 #
-#   conda create -n dima python=3.10 && conda activate dima
-#   pip install -r requirements.txt        # from the repository root
+#   Python 3.13.14, gymnasium 1.2.3, torch 2.12.0+cpu, numpy 2.4.6
 #
-# No package install step is needed for the vendored sources: research/__init__.py
-# puts DIMA/ and mate/ on sys.path.  (`pip install -e ./mate` also works and is
-# harmless, but DIMA cannot be installed that way -- its modules import each other
-# by top-level name, so DIMA/ has to be a sys.path root.)
-#
-# torch is pinned to the CPU build this was verified on.  For CUDA, install
-# torch/torchvision from the matching PyTorch index BEFORE this file:
-#   pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu121
-#
-# NOTE: DIMA/environment.yml is the *upstream DIMA* conda file and does not
-# describe this integration.  This file supersedes it.
+# MATE-main is a gymnasium port, so gym (0.26) is NOT usable here.  The mate
+# package needs only gymnasium, numpy, scipy and pyyaml at import time -- torch,
+# tensorflow, pyglet and pygame are imported lazily, for rendering and for
+# baselines this repository does not use.  So `pip install -e <MATE-main>` is not
+# required: MATE_ROOT plus the packages below is enough.
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# Shared core
-# -----------------------------------------------------------------------------
-# gym, NOT gymnasium: MATE 0.1.0 is written against the gym API.
-#
-# 0.26.2 is what this integration was verified on.  It needs both shims in
-# research/_compat.py: gym >= 0.26 hands out a numpy.random.Generator where MATE
-# calls RandomState methods, and its gym.make wraps environments in
-# PassiveEnvChecker, which rejects MATE's 4-value step() and 2-tuple reset().
-#
-# ALTERNATIVE, shim-free path: pin `gym==0.25.2` together with `numpy<2`.
-# gym 0.25 still exposes randint/rand/randn on its RNG and numpy 1.x still has
-# np.bool8, so both shims detect they are unnecessary and become no-ops.  Nothing
-# in this repository has to change to switch.
-gym==0.26.2
+gymnasium>=1.2.0
+numpy>=1.26
+scipy>=1.11
+torch>=2.8.0
+pyyaml>=6.0.2
 
-# numpy 2.x removed np.bool8, which MATE uses in six modules; research/_compat.py
-# restores the alias.  numpy 1.x is deliberately not required: pinning it on a
-# host that ships numpy 2 (Kaggle, Colab) downgrades it underneath packages
-# compiled against 2.x and produces "ValueError: numpy.dtype size changed".
-numpy==2.2.6
-
-scipy==1.15.3               # MATE dependency; also Spearman/Kendall in diagnostics
-tqdm==4.70.0
-PyYAML==6.0.3               # MATE scenario files
-typing_extensions==4.16.0   # MATE's Literal import on Python < 3.8
-pyglet==2.1.16              # MATE rendering; imported lazily, only for env.render()
-
-# -----------------------------------------------------------------------------
-# DIMA -- world model, diffusion, training loop
-# -----------------------------------------------------------------------------
-torch==2.13.0
-torchvision==0.28.0         # torchvision.ops.focal_loss, used by rew_end_model
-einops==0.8.2
-termcolor==3.3.0            # DreamerLearner prints with cprint
-wandb==0.28.1               # DreamerLearner.step calls wandb_log unconditionally
-tensorboard==2.21.0         # DIMA/tb_logger.py imports torch.utils.tensorboard at module level
-psutil==7.2.2               # DIMA/dataset.py RAM monitoring
-ipdb==0.13.13               # imported at module level by DreamerLearner and DreamerWorker
-
-# cv2 is imported inside DIMA/utils.py:565, in the MuJoCo visualisation helper.
-# The MATE path never calls it, but the import is at function scope so anything
-# that does touch that helper needs opencv present.
-opencv-python==5.0.0.93
-
-# ray is needed only for DIMA's ONLINE route (DreamerRunner + DreamerWorker).
-# This integration trains offline from collected episodes and does not use it;
-# it is pinned so that route stays reproducible.
-ray==2.56.1
-
-# -----------------------------------------------------------------------------
-# Documented conflict (brief section 37)
-# -----------------------------------------------------------------------------
-# mate/mate/evaluate.py imports `pkg_resources` at module level, only to compare
-# gym versions for video recording.  setuptools >= 81 removed pkg_resources, so
-# `python -m mate.evaluate` cannot start on a newer setuptools.
-#
-# research/planners.py falls back to its own five-line entry-point resolver when
-# that import fails, so the research layer itself works on any setuptools.
-# Running MATE's own evaluation script needs setuptools < 81.
-setuptools<81
-
-# -----------------------------------------------------------------------------
-# Optional -- NOT needed to train or evaluate DIMA on MATE
-# -----------------------------------------------------------------------------
-# Used only by the attention-map visualiser inside
-# DIMA/agent/world_models/rew_end_model.py (imported inside the function):
-# matplotlib
-# pandas
-# seaborn
-
-# DIMA's other environment backends.  Their imports are at MODULE level in
-# DIMA/configs/EnvConfigs.py:2-6, so `import configs.EnvConfigs` -- and therefore
-# `DIMA/train.py` -- requires all of them.  This integration does not import that
-# module, which is why none of these are needed for the MATE path.
-# See DIMA/README.md for the upstream installation instructions.
-# pettingzoo==1.22.2        # --env pettingzoo
-# supersuit==3.7.0          # --env pettingzoo
-# smac                      # --env starcraft   (install from source)
-# smacv2                    # --env SMACv2      (install from source)
-# gfootball                 # --env football
-# mujoco-py<2.2,>=2.1       # --env mamujoco
+# Optional: metric logging with --wandb
+# wandb>=0.17
