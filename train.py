@@ -223,11 +223,16 @@ def main():
 
         logger = wandb.init(project='categorical-diffusion-mate', config=config)
 
+    # The device is printed because `auto` falls back to CPU silently when the
+    # installed torch has no CUDA build -- on a GPU server that is worth seeing.
+    device_name = train_config['device']
+    if device_name.startswith('cuda'):
+        device_name += f' ({torch.cuda.get_device_name(torch.device(device_name))})'
     print(
         f'{env.describe()} | codebook {world_model.autoencoder.codebook_size} x '
         f'{config["world_model"]["num_tokens"]} tokens | '
         f'{config["diffusion"]["noise_type"]} diffusion, T={config["diffusion"]["num_steps"]}, '
-        f'{config["diffusion"]["sample_steps"]} sampling steps'
+        f'{config["diffusion"]["sample_steps"]} sampling steps | device {device_name}'
     )
 
     collector.collect(train_config['seed_steps'], random_actions=True)
