@@ -278,17 +278,22 @@ class RunLogger:
 
         self._wandb = wandb
         # Resuming into the original run keeps one continuous set of curves rather
-        # than splitting a preempted job's history across two wandb runs.
+        # than splitting a preempted job's history across two wandb runs.  But the
+        # id is a *hint*, not a contract, and it must never be able to stop a
+        # training job from starting.
         #
-        # 'allow', not 'must'.  The id comes from wandb_run_id.txt, which is written
-        # immediately after wandb.init -- before the run has logged anything.  A job
-        # that died between those two points leaves an id naming a run the server
-        # never registered, and 'must' turns that into a fatal
-        # `UsageError: ... has not been initialized` that kills the training job
-        # before it collects a single episode.  'allow' resumes the run when it
-        # exists and creates it when it does not, which is the intent: continuity
-        # where it is possible, never a crash where it is not.
-        wandb.init(
+        # It comes from wandb_run_id.txt, written immediately after wandb.init --
+        # before the run has logged anything -- so a job that died between those two
+        # points leaves an id naming a run the server never registered.  The id can
+        # also name a run that was since deleted from the project, or one belonging
+        # to an entity this host cannot write to.  Each of those raises out of
+        # wandb.init, and a run directory that has ever crashed would then refuse
+        # every later attempt to train in it.
+        #
+        # 'allow' covers the never-registered case; the fallback covers the rest.
+        # Whatever id the new run gets is written back below, so the dead one is
+        # replaced rather than retried forever.
+        init_kwargs = dict(
             project=project,
             group=group,
             name=name,
@@ -296,9 +301,19 @@ class RunLogger:
             config=dict(config or {}),
             dir=str(self.run_dir),
             reinit=True,
-            id=resume_run_id,
-            resume='allow' if resume_run_id is not None else None,
         )
+        if resume_run_id is None:
+            wandb.init(**init_kwargs)
+        else:
+            try:
+                wandb.init(**init_kwargs, id=resume_run_id, resume='allow')
+            except Exception as exc:  # noqa: BLE001 - any wandb refusal, not one kind
+                log(
+                    'WARN',
+                    f'wandb would not resume run {resume_run_id!r} ({exc}); starting a new '
+                    f'run instead. The curves split here, the training does not stop.',
+                )
+                wandb.init(**init_kwargs)
 
         # Recorded so a restart in this directory can find the run again.
         if wandb.run is not None and getattr(wandb.run, 'id', None):
