@@ -279,6 +279,15 @@ class RunLogger:
         self._wandb = wandb
         # Resuming into the original run keeps one continuous set of curves rather
         # than splitting a preempted job's history across two wandb runs.
+        #
+        # 'allow', not 'must'.  The id comes from wandb_run_id.txt, which is written
+        # immediately after wandb.init -- before the run has logged anything.  A job
+        # that died between those two points leaves an id naming a run the server
+        # never registered, and 'must' turns that into a fatal
+        # `UsageError: ... has not been initialized` that kills the training job
+        # before it collects a single episode.  'allow' resumes the run when it
+        # exists and creates it when it does not, which is the intent: continuity
+        # where it is possible, never a crash where it is not.
         wandb.init(
             project=project,
             group=group,
@@ -288,7 +297,7 @@ class RunLogger:
             dir=str(self.run_dir),
             reinit=True,
             id=resume_run_id,
-            resume='must' if resume_run_id is not None else None,
+            resume='allow' if resume_run_id is not None else None,
         )
 
         # Recorded so a restart in this directory can find the run again.

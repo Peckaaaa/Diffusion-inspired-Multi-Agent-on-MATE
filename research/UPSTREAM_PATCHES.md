@@ -226,6 +226,30 @@ to the denoising trajectory the same dict already carries.
 
 ---
 
+## 7. Sampling buffers pinned to the CPU --- `DreamerMemory.py`
+
+`sample_visits` is allocated with `torch.zeros(capacity, dtype=torch.long)` in
+`init_buffer` and `clean`, and `validate_indices` builds its offsets with a bare
+`torch.arange`. Neither names a device, so both follow the process default.
+
+### The failure
+
+`_compute_visit_probs` ends with `assert probs.device.type == 'cpu'` and
+`sample_indices` is commented "stay on cpu", so the sampling path requires these
+on the host. On a machine where the torch default device is CUDA they are
+allocated on the GPU instead, and the first training round --- the first
+`DreamerLearner.step` that passes both gates, which on a server preset is several
+minutes in --- dies on a bare `AssertionError` with no message.
+
+### The change
+
+`device="cpu"` on the three `sample_visits` allocations and on the `arange`, and
+`load_state_dict` moves a restored buffer to the CPU rather than inheriting the
+device it was saved from. On a host whose default is already the CPU every one of
+these is a no-op, so the behaviour is unchanged where it already worked.
+
+---
+
 ## Compatibility handled *without* touching upstream
 
 For contrast, these four problems were all solved inside `research/` and required

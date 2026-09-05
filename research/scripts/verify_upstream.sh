@@ -20,7 +20,15 @@ MATE_COMMIT='3e631c0c3b043990fc53ae5fc3a37b0f65f230c5'
 ACCEPTED='DIMA/environments.py
 DIMA/agent/learners/DreamerLearner.py
 DIMA/dataset.py
-DIMA/agent/memory/DreamerMemory.py'
+DIMA/agent/memory/DreamerMemory.py
+DIMA/configs/dreamer/DreamerAgentConfig.py
+DIMA/agent/world_models/perceiver.py
+DIMA/agent/world_models/vq.py
+DIMA/agent/world_models/diffusion/inner_model.py
+DIMA/agent/world_models/diffusion/denoiser.py
+DIMA/agent/world_models/diffusion/diffusion_sampler.py
+DIMA/agent/coroutines/env_loop.py
+DIMA/agent/optim/loss.py'
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

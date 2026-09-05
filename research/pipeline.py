@@ -308,9 +308,13 @@ def run_pipeline(
 ) -> Dict[str, Any]:
     if preset not in PRESETS:
         raise ValueError(f'Unknown preset {preset!r}. Known: {", ".join(PRESETS)}')
-    unknown = [s for s in stages if s not in STAGES]
+    # Both spellings are accepted here because the online swap below happens
+    # after this check: --online --stages train_online named a real stage and was
+    # still rejected, with an error listing only the offline names.
+    known = tuple(dict.fromkeys(STAGES + ONLINE_STAGES))
+    unknown = [s for s in stages if s not in known]
     if unknown:
-        raise ValueError(f'Unknown stage(s) {unknown}. Known: {", ".join(STAGES)}')
+        raise ValueError(f'Unknown stage(s) {unknown}. Known: {", ".join(known)}')
 
     size = dict(PRESETS[preset])
     size.setdefault('min_buffer_size', None)

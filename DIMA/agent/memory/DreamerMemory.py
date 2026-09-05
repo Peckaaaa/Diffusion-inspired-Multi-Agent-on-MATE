@@ -41,10 +41,15 @@ class DreamerMemory:
         self.next_idx = 0  # This next_idx represents the length
         self.size = 0
 
+        # device="cpu" is REQUIRED, not a preference: _compute_visit_probs asserts
+        # the sampling probabilities are on the CPU and sample_indices comments
+        # "stay on cpu".  torch.zeros without a device follows the process default,
+        # which is CUDA on hosts that set one, and the assert fires on the first
+        # training round with no indication of why.
         self.sample_visits = {
-            "tokenizer": torch.zeros(self.capacity, dtype=torch.long),
-            "denoiser": torch.zeros(self.capacity, dtype=torch.long),
-            "rew_end_model": torch.zeros(self.capacity, dtype=torch.long)
+            "tokenizer": torch.zeros(self.capacity, dtype=torch.long, device="cpu"),
+            "denoiser": torch.zeros(self.capacity, dtype=torch.long, device="cpu"),
+            "rew_end_model": torch.zeros(self.capacity, dtype=torch.long, device="cpu")
         }
         self.n_agents = n_agents
         self.full = False
@@ -79,7 +84,7 @@ class DreamerMemory:
             getattr(self, name)[:size] = arr
 
         for k, v in state['sample_visits'].items():
-            self.sample_visits[k] = v.clone()
+            self.sample_visits[k] = v.detach().to(device="cpu").clone()
 
         self.next_idx = state['next_idx']
         self.size = size
@@ -182,9 +187,9 @@ class DreamerMemory:
         self.size = 0
 
         self.sample_visits = {
-            "tokenizer": torch.zeros(self.capacity, dtype=torch.long),
-            "denoiser": torch.zeros(self.capacity, dtype=torch.long),
-            "rew_end_model": torch.zeros(self.capacity, dtype=torch.long),
+            "tokenizer": torch.zeros(self.capacity, dtype=torch.long, device="cpu"),
+            "denoiser": torch.zeros(self.capacity, dtype=torch.long, device="cpu"),
+            "rew_end_model": torch.zeros(self.capacity, dtype=torch.long, device="cpu"),
         }
         self.full = False
 
@@ -252,7 +257,7 @@ class DreamerMemory:
         return probs
 
     def validate_indices(self, indices, sequence_length):
-        idxs = (torch.arange(sequence_length) + indices.unsqueeze(1)) % self.capacity
+        idxs = (torch.arange(sequence_length, device="cpu") + indices.unsqueeze(1)) % self.capacity
         valid_indices = indices[(idxs[:, 1:] != self.next_idx).all(-1)]
         return valid_indices
 
