@@ -175,23 +175,26 @@ def env_spec(env):
 def build_policy(spec, config):
     policy_config = config['policy']
     return CommunicativeMAPPO(
-        obs_dim=spec['obs_dim'],
-        msg_dim=spec['msg_dim'],
-        action_dim=spec['action_dim'],
-        state_dim=spec['state_dim'],
-        hidden_dim=policy_config['hidden_dim'],
-        actor_lr=policy_config['actor_lr'],
-        critic_lr=policy_config['critic_lr'],
-        clip_ratio=policy_config['clip_ratio'],
-        entropy_coef=policy_config['entropy_coef'],
-        value_coef=policy_config['value_coef'],
-        max_grad_norm=policy_config['max_grad_norm'],
-        gamma=policy_config['gamma'],
-        lam=policy_config['lam'],
-        ppo_epochs=policy_config['ppo_epochs'],
-        num_minibatches=policy_config['num_minibatches'],
-        device=config['train']['device'],
+    obs_dim=spec['obs_dim'],
+    msg_dim=spec['msg_dim'],
+    action_dim=spec['action_dim'],
+    state_dim=spec['state_dim'],
+    hidden_dim=policy_config['hidden_dim'],
+    actor_lr=policy_config['actor_lr'],
+    critic_lr=policy_config['critic_lr'],
+    clip_ratio=policy_config['clip_ratio'],
+    entropy_coef=policy_config['entropy_coef'],
+    entropy_coef_min=policy_config['entropy_coef_min'],
+    entropy_decay_steps=policy_config['entropy_decay_steps'],
+    value_coef=policy_config['value_coef'],
+    max_grad_norm=policy_config['max_grad_norm'],
+    gamma=policy_config['gamma'],
+    lam=policy_config['lam'],
+    ppo_epochs=policy_config['ppo_epochs'],
+    num_minibatches=policy_config['num_minibatches'],
+    device=config['train']['device'],
     )
+
 
 
 # ------------------------------------------------------------------------- main
@@ -262,7 +265,10 @@ def main():
         policy_metrics = defaultdict(float)
         for _ in range(train_config['policy_updates_per_iter']):
             rollout, imagine_stats = world_model.imagine(policy, buffer, config)
-            for key, value in {**policy.update(rollout), **imagine_stats}.items():
+            for key, value in {
+                **policy.update(rollout, total_env_steps=env_steps),
+                **imagine_stats
+                }.items():
                 policy_metrics[key] += value / train_config['policy_updates_per_iter']
 
         metrics = {

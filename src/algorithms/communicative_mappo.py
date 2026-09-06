@@ -94,7 +94,9 @@ class CommunicativeMAPPO:
         actor_lr=3e-4,
         critic_lr=1e-3,
         clip_ratio=0.2,
-        entropy_coef=1e-3,
+        entropy_coef=3e-3,          # Giá trị ban đầu (ví dụ 0.003)
+        entropy_coef_min=3e-4,      # Giá trị nhỏ nhất sau khi decay (ví dụ 0.0003)
+        entropy_decay_steps=100000, # Tổng số env steps thực hiện decay
         value_coef=0.5,
         max_grad_norm=0.5,
         gamma=0.99,
@@ -111,7 +113,13 @@ class CommunicativeMAPPO:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
         self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
+        
+        # --- Cấu hình Entropy Decay ---
+        self.entropy_coef_init = entropy_coef
+        self.entropy_coef_min = entropy_coef_min
+        self.entropy_decay_steps = entropy_decay_steps
+        self.entropy_coef = entropy_coef  # Sẽ được cập nhật động theo step
+        
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
@@ -156,14 +164,15 @@ class CommunicativeMAPPO:
 
     # ------------------------------------------------------------------- update
 
-    def update(self, batch):
-        """PPO-clip update on a flattened imagined batch.
+    def update(self, batch, total_env_steps=0):
+        """PPO-clip update on a flattened imagined batch with Entropy Decay."""
 
-        ``batch`` holds tensors of shape ``(M, ...)`` where ``M = H * B * n`` for the
-        actor tensors and ``M`` is broadcast from ``H * B`` for the critic ones:
-        ``obs``, ``messages``, ``samples``, ``old_log_probs``, ``advantages``,
-        ``states``, ``returns``, ``old_values``.
-        """
+        # --- Tính toán entropy_coef động theo Linear Decay ---
+        if self.entropy_decay_steps > 0:
+            progress = min(1.0, total_env_steps / self.entropy_decay_steps)
+            self.entropy_coef = self.entropy_coef_init - progress * (
+                self.entropy_coef_init - self.entropy_coef_min
+            )
 
         obs = batch['obs']
         messages = batch['messages']
@@ -196,6 +205,7 @@ class CommunicativeMAPPO:
                 entropy_loss = -entropy.mean()
 
                 self.actor_optimizer.zero_grad(set_to_none=True)
+                # Sử dụng self.entropy_coef động tại đây
                 (policy_loss + self.entropy_coef * entropy_loss).backward()
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
@@ -240,3 +250,5 @@ class CommunicativeMAPPO:
         self.critic.load_state_dict(d['critic'])
         self.actor_optimizer.load_state_dict(d['actor_optimizer'])
         self.critic_optimizer.load_state_dict(d['critic_optimizer'])
+
+    

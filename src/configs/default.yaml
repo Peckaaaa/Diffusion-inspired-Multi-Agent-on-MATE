@@ -1,5 +1,5 @@
 # Discrete categorical diffusion world model on MATE.
-# Override any leaf from the command line:  python train.py --set policy.horizon=10
+# Override any leaf from the command line: python train.py --set policy.horizon=12
 
 env:
   # Resolved against MATE-main/mate/assets (MATE_ROOT overrides the checkout).
@@ -11,48 +11,50 @@ env:
   seed: 0
 
 world_model:
-  levels: [8, 6, 5]        # FSQ grid -> V = 240 classes per token
-  num_tokens: 16           # K_tok discrete tokens per world state
+  levels: [8, 8, 8]        # FSQ grid -> 8*8*8 = 512 classes per token
+  num_tokens: 16           
   ae_hidden: 512
   tf_hidden: 256
   tf_layers: 4
   tf_heads: 8
-  reward_seq_len: 8        # window length for the minGPT reward/termination backbone
+  reward_seq_len: 8        # Window length for the minGPT reward/termination backbone
   lr: 3.0e-4
   grad_clip: 1.0
 
 diffusion:
   num_steps: 20            # T_diff used during training
-  sample_steps: 4          # accelerated reverse process at rollout time
-  noise_type: absorbing    # absorbing (mask token) | uniform (transition matrix)
-  schedule: cosine         # cosine | linear
+  sample_steps: 6          # Accelerated reverse process at rollout time
+  noise_type: absorbing    # Absorbing (mask token) | uniform (transition matrix)
+  schedule: cosine         # Cosine | linear
   sample_temperature: 1.0  # 0 turns the reverse process into argmax decoding
 
 policy:
   hidden_dim: 256
-  actor_lr: 3.0e-4
-  critic_lr: 1.0e-3
+  actor_lr: 3.0e-4              
+  critic_lr: 5.0e-4
   clip_ratio: 0.2
-  entropy_coef: 1.0e-3
+  entropy_coef: 4.5e-3          
+  entropy_coef_min: 4.5e-3      
+  entropy_decay_steps: 0        
   value_coef: 0.5
   max_grad_norm: 0.5
   gamma: 0.99
   lam: 0.95
-  horizon: 15
+  horizon: 16                   
   ppo_epochs: 5
   num_minibatches: 4
 
 train:
-  total_env_steps: 500000
-  seed_steps: 5000
+  total_env_steps: 150000       # 150k steps là thừa đủ với tốc độ học mới
+  seed_steps: 10000             # [TĂNG LÊN 10k] Tạo nền tảng buffer đa dạng ngay từ đầu
   env_steps_per_iter: 1000
-  wm_updates_per_iter: 200
-  policy_updates_per_iter: 10
+  wm_updates_per_iter: 250
+  policy_updates_per_iter: 20   # [TĂNG GẤP ĐÔI] Ép Policy khai thác triệt để mô hình thế giới
   wm_batch_size: 256
   imagine_batch_size: 256
   buffer_capacity: 500000
   eval_every: 10
-  eval_episodes: 3
-  save_dir: runs/categorical_diffusion
+  eval_episodes: 10
+  save_dir: runs/categorical_diffusion_aggressive
   device: auto
-  wandb: false
+  wandb: true
