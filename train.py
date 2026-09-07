@@ -258,7 +258,9 @@ def main():
 
         wm_metrics = defaultdict(float)
         for _ in range(train_config['wm_updates_per_iter']):
-            step_metrics = world_model.update(buffer, train_config['wm_batch_size'])
+            step_metrics = world_model.update(
+                buffer, train_config['wm_batch_size'], total_env_steps=env_steps
+            )
             for key, value in step_metrics.items():
                 wm_metrics[key] += value / train_config['wm_updates_per_iter']
 

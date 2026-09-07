@@ -6,6 +6,8 @@ Two responsibilities:
 ``imagine``   an H-step latent rollout that produces the batch MAPPO trains on.
 """
 
+import math
+
 import torch
 
 from models.categorical_diffusion import CategoricalDiffusion
@@ -71,7 +73,27 @@ class WorldModelTrainer:
         self.grad_clip = wm['grad_clip']
         self.reward_seq_len = wm['reward_seq_len']
 
+        # Cosine decay over the whole run. A constant 3e-4 bottoms the losses out
+        # early and then lets them climb again as the replay distribution shifts.
+        self.lr_init = wm['lr']
+        self.lr_min = wm['lr_min']
+        self.lr_decay_steps = config['train']['total_env_steps']
+
     # ------------------------------------------------------------------ training
+
+    def _set_lr(self, total_env_steps):
+        """Cosine anneal every world-model optimizer; returns the applied lr."""
+
+        if self.lr_decay_steps <= 0:
+            return self.lr_init
+        progress = min(1.0, max(0.0, total_env_steps / self.lr_decay_steps))
+        lr = self.lr_min + 0.5 * (self.lr_init - self.lr_min) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+        for optimizer in self.optimizers.values():
+            for group in optimizer.param_groups:
+                group['lr'] = lr
+        return lr
 
     def _step(self, name, module, loss):
         self.optimizers[name].zero_grad(set_to_none=True)
@@ -79,9 +101,10 @@ class WorldModelTrainer:
         torch.nn.utils.clip_grad_norm_(module.parameters(), self.grad_clip)
         self.optimizers[name].step()
 
-    def update(self, buffer, batch_size):
+    def update(self, buffer, batch_size, total_env_steps=0):
         """One gradient step for the tokenizer, the diffusion model and the reward model."""
 
+        lr = self._set_lr(total_env_steps)
         batch = buffer.sample(batch_size, self.device)
 
         ae_loss, metrics = self.autoencoder.loss(
@@ -118,6 +141,7 @@ class WorldModelTrainer:
 
         metrics.update(diffusion_metrics)
         metrics.update(reward_metrics)
+        metrics['wm/lr'] = lr
         return metrics
 
     # --------------------------------------------------------------- imagination

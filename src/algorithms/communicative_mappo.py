@@ -47,13 +47,22 @@ class CommunicativeActor(nn.Module):
         nn.init.orthogonal_(self.mean.weight, gain=0.01)
         nn.init.zeros_(self.mean.bias)
 
+    def std(self):
+        """Per-dimension standard deviation, bounded so entropy cannot inflate it.
+
+        Upper bound 0.0 caps sigma at 1.0: the mean is tanh-squashed into the
+        normalized action box, so a wider Gaussian can only produce samples the
+        env wrapper clips away while the entropy bonus keeps pushing log_std up.
+        """
+        return self.log_std.clamp(-5.0, 0.0).exp()
+
     def distribution(self, obs, messages):
         features = self.body(torch.cat([obs, messages], dim=-1))
         # tanh on the mean keeps the command inside the normalized action box the
         # env wrapper expects; the sample itself stays Gaussian, so the PPO
         # log-probability needs no change-of-variable correction.
         mean = torch.tanh(self.mean(features))
-        std = self.log_std.clamp(-5.0, 2.0).exp().expand_as(mean)
+        std = self.std().expand_as(mean)
         return torch.distributions.Normal(mean, std)
 
     def forward(self, obs, messages, deterministic=False):
@@ -187,7 +196,13 @@ class CommunicativeMAPPO:
 
         total = obs.shape[0]
         minibatch_size = max(total // self.num_minibatches, 1)
-        metrics = {'ppo/policy_loss': 0.0, 'ppo/value_loss': 0.0, 'ppo/entropy': 0.0, 'ppo/clip_frac': 0.0}
+        metrics = {
+            'ppo/policy_loss': 0.0,
+            'ppo/value_loss': 0.0,
+            'ppo/entropy': 0.0,
+            'ppo/clip_frac': 0.0,
+            'ppo/approx_kl': 0.0,
+        }
         updates = 0
 
         for _ in range(self.ppo_epochs):
@@ -226,14 +241,21 @@ class CommunicativeMAPPO:
 
                 with torch.no_grad():
                     clip_frac = ((ratio - 1.0).abs() > self.clip_ratio).float().mean().item()
+                    log_ratio = log_probs - old_log_probs[index]
+                    approx_kl = (ratio - 1.0 - log_ratio).mean().item()
 
                 metrics['ppo/policy_loss'] += policy_loss.item()
                 metrics['ppo/value_loss'] += value_loss.item()
                 metrics['ppo/entropy'] += entropy.mean().item()
                 metrics['ppo/clip_frac'] += clip_frac
+                metrics['ppo/approx_kl'] += approx_kl
                 updates += 1
 
-        return {k: v / max(updates, 1) for k, v in metrics.items()}
+        averaged = {k: v / max(updates, 1) for k, v in metrics.items()}
+        with torch.no_grad():
+            averaged['ppo/action_std_mean'] = self.actor.std().mean().item()
+        averaged['ppo/entropy_coef'] = self.entropy_coef
+        return averaged
 
     # ---------------------------------------------------------------- serialize
 
