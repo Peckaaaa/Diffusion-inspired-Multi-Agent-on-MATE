@@ -39,9 +39,9 @@ policy:
   actor_lr: 3.0e-4              
   critic_lr: 5.0e-4
   clip_ratio: 0.2
-  entropy_coef: 4.5e-3
-  entropy_coef_min: 3.0e-4
-  entropy_decay_steps: 60000
+  entropy_coef: 3.5e-3
+  entropy_coef_min: 1.5e-3
+  entropy_decay_steps: 80000
   value_coef: 0.5
   max_grad_norm: 0.5
   gamma: 0.99
