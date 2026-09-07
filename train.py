@@ -206,6 +206,7 @@ def build_policy(spec, config):
     lam=policy_config['lam'],
     ppo_epochs=policy_config['ppo_epochs'],
     num_minibatches=policy_config['num_minibatches'],
+    target_kl=policy_config['target_kl'],
     device=config['train']['device'],
     )
 

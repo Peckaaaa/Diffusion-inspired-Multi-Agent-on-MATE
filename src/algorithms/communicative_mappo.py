@@ -47,14 +47,22 @@ class CommunicativeActor(nn.Module):
         nn.init.orthogonal_(self.mean.weight, gain=0.01)
         nn.init.zeros_(self.mean.bias)
 
+    LOG_STD_BOUNDS = (-1.2, 0.0)
+
     def std(self):
-        """Per-dimension standard deviation, bounded so entropy cannot inflate it.
+        """Per-dimension standard deviation, bounded at both ends.
 
         Upper bound 0.0 caps sigma at 1.0: the mean is tanh-squashed into the
         normalized action box, so a wider Gaussian can only produce samples the
         env wrapper clips away while the entropy bonus keeps pushing log_std up.
+
+        Lower bound -1.2 floors sigma at 0.30.  With the entropy coefficient at
+        its own floor the PPO gradient still drove sigma down without slowing,
+        and coverage fell once it went under ~0.37: the policy was sharpening
+        onto a mode the real environment does not reward.  A hard bound holds
+        where a bonus term cannot.
         """
-        return self.log_std.clamp(-5.0, 0.0).exp()
+        return self.log_std.clamp(*self.LOG_STD_BOUNDS).exp()
 
     def distribution(self, obs, messages):
         features = self.body(torch.cat([obs, messages], dim=-1))
@@ -112,6 +120,7 @@ class CommunicativeMAPPO:
         lam=0.95,
         ppo_epochs=5,
         num_minibatches=4,
+        target_kl=0.015,
         device='cpu',
     ):
         self.device = torch.device(device)
@@ -135,6 +144,7 @@ class CommunicativeMAPPO:
         self.lam = lam
         self.ppo_epochs = ppo_epochs
         self.num_minibatches = num_minibatches
+        self.target_kl = target_kl
 
     # -------------------------------------------------------------- interaction
 
@@ -204,8 +214,10 @@ class CommunicativeMAPPO:
             'ppo/approx_kl': 0.0,
         }
         updates = 0
+        epochs_run = 0
 
         for _ in range(self.ppo_epochs):
+            epoch_kl, epoch_minibatches = 0.0, 0
             permutation = torch.randperm(total, device=self.device)
             for start in range(0, total, minibatch_size):
                 index = permutation[start : start + minibatch_size]
@@ -250,11 +262,21 @@ class CommunicativeMAPPO:
                 metrics['ppo/clip_frac'] += clip_frac
                 metrics['ppo/approx_kl'] += approx_kl
                 updates += 1
+                epoch_kl += approx_kl
+                epoch_minibatches += 1
+
+            epochs_run += 1
+            # Stop the remaining epochs once this one has already moved the
+            # policy far enough: late in training the update kept growing while
+            # sigma shrank, which is the policy sharpening rather than improving.
+            if self.target_kl > 0 and epoch_kl / max(epoch_minibatches, 1) > self.target_kl:
+                break
 
         averaged = {k: v / max(updates, 1) for k, v in metrics.items()}
         with torch.no_grad():
             averaged['ppo/action_std_mean'] = self.actor.std().mean().item()
         averaged['ppo/entropy_coef'] = self.entropy_coef
+        averaged['ppo/epochs_run'] = float(epochs_run)
         return averaged
 
     # ---------------------------------------------------------------- serialize

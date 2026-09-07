@@ -73,8 +73,16 @@ class WorldModelTrainer:
         self.grad_clip = wm['grad_clip']
         self.reward_seq_len = wm['reward_seq_len']
 
-        # Cosine decay over the whole run. A constant 3e-4 bottoms the losses out
-        # early and then lets them climb again as the replay distribution shifts.
+        # Cosine decay over the whole run, for the diffusion and reward models
+        # only: a constant 3e-4 bottoms their losses out early and then lets them
+        # climb again as the replay distribution shifts.
+        #
+        # The tokenizer is excluded.  It has to keep tracking a replay
+        # distribution that never stops moving, and decaying its lr made both its
+        # reconstruction losses and its codebook usage degrade -- usage fell from
+        # 0.997 to 0.950 in step with the decay, which is the encoder collapsing
+        # its range, not running out of grid cells.
+        self.decayed = ('diffusion', 'reward')
         self.lr_init = wm['lr']
         self.lr_min = wm['lr_min']
         self.lr_decay_steps = config['train']['total_env_steps']
@@ -82,7 +90,7 @@ class WorldModelTrainer:
     # ------------------------------------------------------------------ training
 
     def _set_lr(self, total_env_steps):
-        """Cosine anneal every world-model optimizer; returns the applied lr."""
+        """Cosine anneal the decayed optimizers; returns the annealed lr."""
 
         if self.lr_decay_steps <= 0:
             return self.lr_init
@@ -90,8 +98,8 @@ class WorldModelTrainer:
         lr = self.lr_min + 0.5 * (self.lr_init - self.lr_min) * (
             1.0 + math.cos(math.pi * progress)
         )
-        for optimizer in self.optimizers.values():
-            for group in optimizer.param_groups:
+        for name in self.decayed:
+            for group in self.optimizers[name].param_groups:
                 group['lr'] = lr
         return lr
 
@@ -142,6 +150,7 @@ class WorldModelTrainer:
         metrics.update(diffusion_metrics)
         metrics.update(reward_metrics)
         metrics['wm/lr'] = lr
+        metrics['wm/ae_lr'] = self.optimizers['ae'].param_groups[0]['lr']
         return metrics
 
     # --------------------------------------------------------------- imagination
