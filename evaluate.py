@@ -9,6 +9,19 @@ import numpy as np
 import torch
 
 
+def weighted_mean(pairs):
+    """Mean of ``(value, weight)`` pairs; 0.0 when there is no weight.
+
+    Coverage rate is a mean over MATE steps, so a decision that held its action
+    for five of them counts five times as much as one cut short by an episode end.
+    """
+
+    total = sum(weight for _, weight in pairs)
+    if total == 0:
+        return 0.0
+    return float(sum(value * weight for value, weight in pairs) / total)
+
+
 def evaluate_policy(env, policy, episodes, deterministic=True, render=False):
     """Run whole episodes in the real environment.  No world model involved."""
 
@@ -25,9 +38,9 @@ def evaluate_policy(env, policy, episodes, deterministic=True, render=False):
             if render:
                 env.render()
             total += reward
-            coverage.append(info['coverage_rate'])
+            coverage.append((info['coverage_rate'], info['env_steps']))
         returns.append(total)
-        coverages.append(float(np.mean(coverage)))
+        coverages.append(weighted_mean(coverage))
 
     return {
         'eval/episode_return': float(np.mean(returns)),

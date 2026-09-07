@@ -4,7 +4,8 @@
 env:
   # Resolved against MATE-main/mate/assets (MATE_ROOT overrides the checkout).
   scenario: MATE-4v8-9
-  max_episode_steps: 200
+  max_episode_steps: 200      # MATE steps per episode; with frame_skip 5 that is 40 decisions
+  frame_skip: 5               # Hold each action for 5 MATE steps, as the paper's HRL baselines do
   msg_dim: 8
   camera_comm: true
   reward_scale: 1.0
@@ -36,7 +37,7 @@ policy:
   clip_ratio: 0.2
   entropy_coef: 4.5e-3
   entropy_coef_min: 3.0e-4
-  entropy_decay_steps: 60000
+  entropy_decay_steps: 300000
   value_coef: 0.5
   max_grad_norm: 0.5
   gamma: 0.99
@@ -46,16 +47,20 @@ policy:
   num_minibatches: 4
 
 train:
-  total_env_steps: 150000       # 150k steps là thừa đủ với tốc độ học mới
-  seed_steps: 10000             # [TĂNG LÊN 10k] Tạo nền tảng buffer đa dạng ngay từ đầu
-  env_steps_per_iter: 1000
+  # Every step budget below counts MATE steps, not decisions, so it stays
+  # comparable with the paper's 10M-step axis across frame-skip settings.
+  # At frame_skip 5 these are the previous run's decision counts times five:
+  # same transitions per iteration, same iteration count.
+  total_env_steps: 750000
+  seed_steps: 50000
+  env_steps_per_iter: 5000
   wm_updates_per_iter: 250
   policy_updates_per_iter: 20   # [TĂNG GẤP ĐÔI] Ép Policy khai thác triệt để mô hình thế giới
   wm_batch_size: 256
   imagine_batch_size: 256
   buffer_capacity: 500000
   eval_every: 10
-  eval_episodes: 10
+  eval_episodes: 30             # std was 0.03-0.08 at 10; the gains being chased are 0.10-0.20
   save_dir: runs/categorical_diffusion_aggressive
   device: auto
   wandb: true

@@ -81,6 +81,7 @@ class MATEEnv:
         msg_dim=8,
         camera_comm=True,
         reward_scale=1.0,
+        frame_skip=1,
         seed=0,
         normalize=True,
     ):
@@ -94,6 +95,7 @@ class MATEEnv:
         self.camera_comm = camera_comm
         self.reward_scale = reward_scale
         self.max_episode_steps = max_episode_steps
+        self.frame_skip = int(frame_skip)
 
         # make_environment() instead of gym.make(): it builds MultiAgentTracking
         # directly, with no checker wrapper in front of MATE's
@@ -135,7 +137,7 @@ class MATEEnv:
         return (
             f'{self.scenario}: {self.n_agents} cameras, {self.n_targets} targets, '
             f'{self.n_obstacles} obstacles | state {self.state_dim}, obs {self.obs_dim}, '
-            f'action {self.action_dim}, msg {self.msg_dim}'
+            f'action {self.action_dim}, msg {self.msg_dim}, frame skip {self.frame_skip}'
         )
 
     def _norm_obs(self, obs):
@@ -207,41 +209,58 @@ class MATEEnv:
         }
 
     def step(self, actions, messages=None):
-        """Exchange messages, then advance MATE by one step.
+        """Exchange messages, then hold the action for ``frame_skip`` MATE steps.
+
+        The messages are exchanged once per decision, not once per MATE step: the
+        policy only gets to speak when it gets to act.  Every returned rate is the
+        mean over the MATE steps this decision actually consumed, so an episode
+        mean over decisions still equals the per-MATE-step mean when weighted by
+        ``info['env_steps']`` -- which is what MATE's coverage-rate metric is
+        defined over.
 
         Args:
             actions: ``(n_agents, action_dim)`` in ``[-1, 1]``.
-            messages: ``(n_agents, msg_dim)`` broadcast at this step.
+            messages: ``(n_agents, msg_dim)`` broadcast at this decision.
 
         Returns:
             ``(next, reward, done, info)``.  ``next['messages']`` is what each
-            camera received -- the message input of the *next* decision, one step
-            later, because a simultaneous exchange would be circular.
+            camera received -- the message input of the *next* decision, one
+            decision later, because a simultaneous exchange would be circular.
         """
 
         if messages is None:
             messages = np.zeros((self.n_agents, self.msg_dim), dtype=np.float32)
 
         received = self._exchange_messages(messages)
-        obs, _, terminated, truncated, infos = self.env.step(self._scale_action(actions))
-        # MATE-main folds the episode-step limit into `terminated`; `truncated` is
-        # always False, but both are honored here.
-        done = bool(terminated) or bool(truncated)
-        self.episode_step += 1
+        scaled = self._scale_action(actions)
 
-        # MATE's raw team reward is unbounded below (measured min -198); its own
-        # coverage_rate metric is the team-mean tracking rate in [0, 1] and is
-        # what this task optimizes.
-        coverage_rate = float(infos[0]['coverage_rate'])
+        rates = {'coverage_rate': 0.0, 'real_coverage_rate': 0.0, 'mean_transport_rate': 0.0}
+        consumed = 0
+        done = False
+        for _ in range(self.frame_skip):
+            obs, _, terminated, truncated, infos = self.env.step(scaled)
+            # MATE-main folds the episode-step limit into `terminated`; `truncated`
+            # is always False, but both are honored here.
+            done = bool(terminated) or bool(truncated)
+            self.episode_step += 1
+            consumed += 1
+
+            # MATE's raw team reward is unbounded below (measured min -198); its
+            # own coverage_rate metric is the team-mean tracking rate in [0, 1]
+            # and is what this task optimizes.
+            for key in rates:
+                rates[key] += float(infos[0][key])
+
+            if done:
+                break
+
+        for key in rates:
+            rates[key] /= consumed
 
         nxt = {
             'state': self._norm_state(self.env.unwrapped.state()),
             'obs': self._norm_obs(obs),
             'messages': received,
         }
-        info = {
-            'coverage_rate': coverage_rate,
-            'real_coverage_rate': float(infos[0]['real_coverage_rate']),
-            'mean_transport_rate': float(infos[0]['mean_transport_rate']),
-        }
-        return nxt, coverage_rate * self.reward_scale, done, info
+        info = dict(rates, env_steps=consumed)
+        return nxt, rates['coverage_rate'] * self.reward_scale, done, info

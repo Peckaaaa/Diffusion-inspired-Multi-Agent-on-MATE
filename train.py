@@ -32,7 +32,7 @@ from algorithms.communicative_mappo import CommunicativeMAPPO
 from algorithms.replay_buffer import ReplayBuffer
 from algorithms.world_model_trainer import WorldModelTrainer
 from envs.mate_wrapper import MATEEnv
-from evaluate import evaluate_policy
+from evaluate import evaluate_policy, weighted_mean
 
 
 # ------------------------------------------------------------------------ config
@@ -95,8 +95,16 @@ class Collector:
         self.finished_episodes = []
 
     def collect(self, num_steps, random_actions=False):
+        """Step until ``num_steps`` MATE steps have been consumed; returns that count.
+
+        The budget is denominated in MATE steps, not decisions, so it stays
+        comparable across frame-skip settings.  One decision consumes up to
+        ``env.frame_skip`` of them.
+        """
+
         n = self.env.n_agents
-        for _ in range(num_steps):
+        consumed = 0
+        while consumed < num_steps:
             if random_actions:
                 actions = np.random.uniform(-1.0, 1.0, (n, self.env.action_dim)).astype(np.float32)
                 emissions = np.random.uniform(-1.0, 1.0, (n, self.env.msg_dim)).astype(np.float32)
@@ -119,20 +127,25 @@ class Collector:
                 done=done,
             )
 
+            consumed += info['env_steps']
             self.episode_return += reward
-            self.episode_coverage.append(info['coverage_rate'])
+            # Weighted by MATE steps: the last decision of an episode can be cut
+            # short, and MATE's coverage rate is a mean over MATE steps.
+            self.episode_coverage.append((info['coverage_rate'], info['env_steps']))
             self.current = nxt
 
             if done:
                 self.finished_episodes.append(
                     {
                         'return': self.episode_return,
-                        'coverage_rate': float(np.mean(self.episode_coverage)),
+                        'coverage_rate': weighted_mean(self.episode_coverage),
                     }
                 )
                 self.episode_return = 0.0
                 self.episode_coverage = []
                 self.current = self.env.reset()
+
+        return consumed
 
     def drain_stats(self):
         if not self.finished_episodes:
@@ -158,6 +171,7 @@ def build_env(config, seed_offset=0):
         msg_dim=env_config['msg_dim'],
         camera_comm=env_config['camera_comm'],
         reward_scale=env_config['reward_scale'],
+        frame_skip=env_config['frame_skip'],
         seed=env_config['seed'] + seed_offset,
     )
 
@@ -245,16 +259,14 @@ def main():
         f'{config["diffusion"]["sample_steps"]} sampling steps | device {device_name}'
     )
 
-    collector.collect(train_config['seed_steps'], random_actions=True)
-    env_steps = train_config['seed_steps']
+    env_steps = collector.collect(train_config['seed_steps'], random_actions=True)
     iteration = 0
     start = time.time()
 
     while env_steps < train_config['total_env_steps']:
         iteration += 1
 
-        collector.collect(train_config['env_steps_per_iter'])
-        env_steps += train_config['env_steps_per_iter']
+        env_steps += collector.collect(train_config['env_steps_per_iter'])
 
         wm_metrics = defaultdict(float)
         for _ in range(train_config['wm_updates_per_iter']):
