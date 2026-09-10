@@ -1,13 +1,27 @@
 """Ring buffer of real MATE transitions.
 
-Two kinds of message are stored, and they are not interchangeable:
+Four fields are worth explaining:
 
-``messages_in``   what each camera received -- the actor's input and the
-                  autoencoder's reconstruction target.
-``messages_out``  what each camera broadcast -- the diffusion model's
-                  conditioning, because the emission is what actually moves the
-                  next state, and because conditioning on it is the only thing
-                  that gives the actor's message head a policy gradient.
+``beliefs``       what each camera knew after the peer-to-peer round -- its own
+                  target slots merged with its neighbours', plus how stale each
+                  slot is.  This is the actor's input and the autoencoder's
+                  reconstruction target, so imagination can hand the policy the
+                  same kind of thing the environment does.
+
+``prev_actions``  the command each camera issued one step earlier.  The
+                  observation carries the camera's current angle but not the
+                  direction it was turning, so without this the policy cannot
+                  tell a sweep from a hold, and a camera that currently sees
+                  nothing has no way to keep doing what it was doing.
+
+``hidden``        the actor's recurrent belief when it chose that transition's
+                  action, so imagination can start from the state the policy was
+                  actually in rather than from a blank memory.
+
+``target_positions``  where the targets truly were, in belief coordinates.  A
+                  window of these is the label the trajectory head is fitted to;
+                  it comes from the global state, so it is training-time
+                  information only and never reaches a camera.
 """
 
 import numpy as np
@@ -15,7 +29,17 @@ import torch
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, n_agents, state_dim, obs_dim, msg_dim, action_dim):
+    def __init__(
+        self,
+        capacity,
+        n_agents,
+        n_targets,
+        state_dim,
+        obs_dim,
+        belief_dim,
+        action_dim,
+        hidden_dim,
+    ):
         self.capacity = capacity
         self.size = 0
         self.position = 0
@@ -23,10 +47,12 @@ class ReplayBuffer:
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.obs = np.zeros((capacity, n_agents, obs_dim), dtype=np.float32)
-        self.messages_in = np.zeros((capacity, n_agents, msg_dim), dtype=np.float32)
-        self.messages_out = np.zeros((capacity, n_agents, msg_dim), dtype=np.float32)
-        self.next_messages_in = np.zeros((capacity, n_agents, msg_dim), dtype=np.float32)
+        self.beliefs = np.zeros((capacity, n_agents, belief_dim), dtype=np.float32)
+        self.next_beliefs = np.zeros((capacity, n_agents, belief_dim), dtype=np.float32)
         self.actions = np.zeros((capacity, n_agents, action_dim), dtype=np.float32)
+        self.prev_actions = np.zeros((capacity, n_agents, action_dim), dtype=np.float32)
+        self.hidden = np.zeros((capacity, n_agents, hidden_dim), dtype=np.float32)
+        self.target_positions = np.zeros((capacity, n_targets, 2), dtype=np.float32)
         self.rewards = np.zeros((capacity,), dtype=np.float32)
         self.dones = np.zeros((capacity,), dtype=np.float32)
         # Episode id per slot, so sequence sampling never crosses a reset.
@@ -40,23 +66,27 @@ class ReplayBuffer:
         self,
         state,
         obs,
-        messages_in,
-        messages_out,
+        beliefs,
         actions,
+        prev_actions,
+        hidden,
+        target_positions,
         reward,
         next_state,
-        next_messages_in,
+        next_beliefs,
         done,
     ):
         i = self.position
         self.states[i] = state
         self.obs[i] = obs
-        self.messages_in[i] = messages_in
-        self.messages_out[i] = messages_out
+        self.beliefs[i] = beliefs
         self.actions[i] = actions
+        self.prev_actions[i] = prev_actions
+        self.hidden[i] = hidden
+        self.target_positions[i] = target_positions
         self.rewards[i] = reward
         self.next_states[i] = next_state
-        self.next_messages_in[i] = next_messages_in
+        self.next_beliefs[i] = next_beliefs
         self.dones[i] = float(done)
         self.episode_ids[i] = self.current_episode
 
@@ -74,10 +104,12 @@ class ReplayBuffer:
             'states': as_tensor(self.states),
             'next_states': as_tensor(self.next_states),
             'obs': as_tensor(self.obs),
-            'messages_in': as_tensor(self.messages_in),
-            'messages_out': as_tensor(self.messages_out),
-            'next_messages_in': as_tensor(self.next_messages_in),
+            'beliefs': as_tensor(self.beliefs),
+            'next_beliefs': as_tensor(self.next_beliefs),
             'actions': as_tensor(self.actions),
+            'prev_actions': as_tensor(self.prev_actions),
+            'hidden': as_tensor(self.hidden),
+            'target_positions': as_tensor(self.target_positions),
             'rewards': as_tensor(self.rewards),
             'dones': as_tensor(self.dones),
         }

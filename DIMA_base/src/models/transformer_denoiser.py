@@ -2,7 +2,13 @@
 
 Predicts the clean next-state tokens from their noised version:
 
-    p_theta(hat_I_{t+1}^0 | I_{t+1}^tau, tau, I_t, a_t^{1:n}, m_t^{emit})
+    p_theta(hat_I_{t+1}^0 | I_{t+1}^tau, tau, I_t, a_t^{1:n})
+
+Messages are not conditioned on.  What a camera publishes is its observed target
+slots, a deterministic function of the state the context tokens already encode,
+so conditioning on it would repeat information rather than add any -- unlike a
+learned emission, which had to be conditioned on because nothing else carried
+it.
 
 Every camera is one token in a single unmasked sequence, so all cameras are
 attended to simultaneously and no camera ordering can bias the prediction -- the
@@ -43,7 +49,6 @@ class JointCameraDenoiser(nn.Module):
         num_tokens,
         n_agents,
         action_dim,
-        msg_dim,
         hidden_dim=256,
         n_layers=4,
         n_heads=8,
@@ -61,7 +66,7 @@ class JointCameraDenoiser(nn.Module):
         self.noisy_pos_embedding = nn.Parameter(torch.zeros(1, num_tokens, hidden_dim))
         self.context_pos_embedding = nn.Parameter(torch.zeros(1, num_tokens, hidden_dim))
 
-        self.camera_projection = nn.Linear(action_dim + msg_dim, hidden_dim)
+        self.camera_projection = nn.Linear(action_dim, hidden_dim)
         self.camera_id_embedding = nn.Embedding(n_agents, hidden_dim)
 
         self.time_mlp = nn.Sequential(
@@ -85,7 +90,7 @@ class JointCameraDenoiser(nn.Module):
         nn.init.normal_(self.noisy_pos_embedding, std=0.02)
         nn.init.normal_(self.context_pos_embedding, std=0.02)
 
-    def forward(self, noisy_indices, timesteps, context_indices, actions, emissions):
+    def forward(self, noisy_indices, timesteps, context_indices, actions):
         """-> logits ``(B, num_tokens, num_classes)`` over the clean next-state tokens.
 
         Args:
@@ -93,16 +98,13 @@ class JointCameraDenoiser(nn.Module):
             timesteps: ``(B,)`` diffusion step.
             context_indices: ``(B, T)`` clean tokens of the current state ``I_t``.
             actions: ``(B, n, action_dim)``.
-            emissions: ``(B, n, msg_dim)`` messages broadcast at this step.
         """
 
         noisy = self.noisy_embedding(noisy_indices) + self.noisy_pos_embedding
         context = self.context_embedding(context_indices) + self.context_pos_embedding
 
         ids = torch.arange(self.n_agents, device=noisy_indices.device)
-        cameras = self.camera_projection(
-            torch.cat([actions, emissions], dim=-1)
-        ) + self.camera_id_embedding(ids)
+        cameras = self.camera_projection(actions) + self.camera_id_embedding(ids)
 
         time = self.time_mlp(timestep_embedding(timesteps, self.hidden_dim)).unsqueeze(1)
 

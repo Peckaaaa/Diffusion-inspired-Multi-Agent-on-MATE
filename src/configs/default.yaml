@@ -1,69 +1,82 @@
-# Discrete categorical diffusion world model on MATE.
-# Override any leaf from the command line: python train.py --set policy.horizon=12
+# Diffusion-driven trajectory planning on MATE.
+# Override any leaf from the command line: python train.py --set planner.samples=128
 
 env:
   # Resolved against MATE-main/mate/assets (MATE_ROOT overrides the checkout).
   scenario: MATE-4v8-9
   max_episode_steps: 200      # MATE steps per episode
-  # frame_skip 5 was tried and reverted: same coverage ceiling (0.4035 vs 0.4068)
-  # but reached at 250k steps instead of 50k, because a 5-step jump widens the
-  # dynamics gap the diffusion has to cross and spreads the same number of
-  # transitions over five times the state space.
+  # frame_skip 5 was tried and reverted: same coverage ceiling but reached far
+  # later, because a 5-step jump widens the gap the trajectory head has to cross
+  # and spreads the same number of transitions over five times the state space.
   frame_skip: 1
-  msg_dim: 8
   camera_comm: true
+  # Peer-to-peer reach in map units.  Cameras in this scenario sit 1015 apart at
+  # the closest and 1406 at the median, so a shorter reach disconnects the team
+  # and an unlimited one makes every camera merge to the same union -- which
+  # collapses the peer-to-peer belief into a broadcast and drives the consensus
+  # term to exactly zero.  At 1500 roughly two thirds of the pairs can talk.
+  comm_range: 1500.0
+  # Oracle field-of-view fusion: every camera observes the union of the team's
+  # view.  Not deployable -- it is the ceiling `phase0.py` measures against.
+  shared_fov: false
   reward_scale: 1.0
   seed: 0
 
-world_model:
-  levels: [8, 8, 8]        # FSQ grid -> 8*8*8 = 512 classes per token
-  num_tokens: 16           
-  ae_hidden: 512
-  tf_hidden: 256
-  tf_layers: 4
-  tf_heads: 8
-  reward_seq_len: 8        # Window length for the minGPT reward/termination backbone
-  lr: 3.0e-4               # Autoencoder holds this; diffusion and reward anneal to lr_min
-  lr_min: 3.0e-5
-  grad_clip: 1.0
-
-diffusion:
-  num_steps: 20            # T_diff used during training
-  sample_steps: 6          # Accelerated reverse process at rollout time
-  noise_type: absorbing    # Absorbing (mask token) | uniform (transition matrix)
-  schedule: cosine         # Cosine | linear
-  sample_temperature: 1.0  # 0 turns the reverse process into argmax decoding
-
-policy:
+trajectory:
+  # Steps ahead the flow head generates for every believed target.  Four is what
+  # a camera can act on: rotation is capped at 5 deg/step, so a longer roll
+  # changes nothing it could reach in time.
+  horizon: 4
   hidden_dim: 256
-  actor_lr: 3.0e-4              
-  critic_lr: 5.0e-4
-  clip_ratio: 0.2
-  entropy_coef: 3.5e-3
-  entropy_coef_min: 1.5e-3
-  entropy_decay_steps: 80000
-  value_coef: 0.5
-  max_grad_norm: 0.5
-  gamma: 0.99
-  lam: 0.95
-  horizon: 16                   
-  ppo_epochs: 5
-  num_minibatches: 4
-  target_kl: 0.015              # Stop the remaining epochs once an epoch moves this far; 0 disables
+  # Targets move about 0.013 belief units per step per axis here, so labels are
+  # scaled to O(1) before the unit-Gaussian prior sees them.
+  displacement_scale: 75.0
+  # Euler steps when sampling a future.  Four is enough for a 64-dimensional
+  # sample and keeps a decision inside one millisecond on GPU.
+  sample_steps: 4
+  lr: 3.0e-4
+  max_grad_norm: 1.0
+  # Small on purpose.  Agreement alone has a trivial optimum -- every camera
+  # predicting the same constant -- so it is a nudge beside the supervised
+  # anchor, and the two losses are logged apart to catch that failure.
+  consensus_weight: 0.1
+
+planner:
+  # Candidates are scored against the sampled target trajectories through MATE's
+  # own camera optics, which are closed-form, so a candidate costs arithmetic
+  # rather than a generative rollout.
+  samples: 64
+  # Softmax sharpness over candidate returns.  Lower commits to the best plan,
+  # higher averages over near-ties.
+  temperature: 0.05
+  # Exploration width as a fraction of the action box half-range.
+  noise_scale: 0.6
+  discount: 0.95
+  # Soft detection margins, in map units and degrees.  A hard in-or-out count is
+  # flat almost everywhere and a softmax over a flat landscape is a coin flip.
+  range_softness: 60.0
+  angle_softness: 6.0
+  # How much of a neighbour's published claim to subtract from a target's worth.
+  # Coverage counts distinct targets, so without this the cameras that share a
+  # belief all plan the same sweep.
+  intent_discount: 0.8
 
 train:
-  # Every step budget below counts MATE steps, not decisions, so it stays
-  # comparable with the paper's 10M-step axis across frame-skip settings.
-  total_env_steps: 150000
-  seed_steps: 10000
+  # Every step budget counts MATE steps, not decisions, so it stays comparable
+  # across frame-skip settings.
+  total_env_steps: 50000
   env_steps_per_iter: 1000
-  wm_updates_per_iter: 250
-  policy_updates_per_iter: 20   # [TĂNG GẤP ĐÔI] Ép Policy khai thác triệt để mô hình thế giới
-  wm_batch_size: 256
-  imagine_batch_size: 256
-  buffer_capacity: 500000
+  # Random commands until the head has seen something: its samples are noise
+  # before that, and a planner chasing noise fills the buffer more slowly.
+  warmup_steps: 2000
+  trajectory_updates_per_iter: 20
+  trajectory_batch_size: 256
+  buffer_capacity: 200000
   eval_every: 10
-  eval_episodes: 30             # std was 0.03-0.08 at 10; the gains being chased are 0.10-0.20
-  save_dir: runs/categorical_diffusion_aggressive
+  eval_episodes: 20
   device: auto
+  # Pinned host memory makes the buffer's host-to-device copy asynchronous.
+  # Ignored on CPU.
+  pin_memory: true
   wandb: true
+  save_dir: null    # set from --tag and --seed unless --save-dir is given

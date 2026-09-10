@@ -4,6 +4,12 @@ Two responsibilities:
 
 ``update``    one gradient step on real transitions for all three components.
 ``imagine``   an H-step latent rollout that produces the batch MAPPO trains on.
+
+The tokenizer encodes the global state together with every camera's belief, so
+imagination can hand the policy both the world (for the critic) and what each
+camera would know about it (for the actor).  What a camera publishes on the
+channel is not modelled: it is a deterministic function of the state the tokens
+already carry.
 """
 
 import math
@@ -27,7 +33,7 @@ class WorldModelTrainer:
         self.autoencoder = StateAutoEncoder(
             state_dim=env_spec['state_dim'],
             obs_dim=env_spec['obs_dim'],
-            msg_dim=env_spec['msg_dim'],
+            belief_dim=env_spec['belief_dim'],
             n_agents=env_spec['n_agents'],
             levels=tuple(wm['levels']),
             num_tokens=wm['num_tokens'],
@@ -39,7 +45,6 @@ class WorldModelTrainer:
             num_tokens=wm['num_tokens'],
             n_agents=env_spec['n_agents'],
             action_dim=env_spec['action_dim'],
-            msg_dim=env_spec['msg_dim'],
             hidden_dim=wm['tf_hidden'],
             n_layers=wm['tf_layers'],
             n_heads=wm['tf_heads'],
@@ -116,30 +121,29 @@ class WorldModelTrainer:
         batch = buffer.sample(batch_size, self.device)
 
         ae_loss, metrics = self.autoencoder.loss(
-            batch['states'], batch['obs'], batch['messages_in']
+            batch['states'], batch['obs'], batch['beliefs']
         )
         self._step('ae', self.autoencoder, ae_loss)
 
         # Tokens are targets, not differentiable inputs: the diffusion and reward
         # models are trained against the codes the (just updated) tokenizer emits.
         with torch.no_grad():
-            indices = self.autoencoder.encode_indices(batch['states'], batch['messages_in'])
+            indices = self.autoencoder.encode_indices(batch['states'], batch['beliefs'])
             next_indices = self.autoencoder.encode_indices(
-                batch['next_states'], batch['next_messages_in']
+                batch['next_states'], batch['next_beliefs']
             )
 
         diffusion_loss, diffusion_metrics = self.diffusion.loss(
             clean_indices=next_indices,
             context_indices=indices,
             actions=batch['actions'],
-            emissions=batch['messages_out'],
         )
         self._step('diffusion', self.diffusion, diffusion_loss)
 
         sequence = buffer.sample_sequences(batch_size, self.reward_seq_len, self.device)
         with torch.no_grad():
             flat_indices = self.autoencoder.encode_indices(
-                sequence['states'].flatten(0, 1), sequence['messages_in'].flatten(0, 1)
+                sequence['states'].flatten(0, 1), sequence['beliefs'].flatten(0, 1)
             ).view(*sequence['states'].shape[:2], -1)
 
         reward_loss, reward_metrics = self.reward_model.loss(
@@ -169,26 +173,36 @@ class WorldModelTrainer:
         n_agents = buffer.obs.shape[1]
 
         batch = buffer.sample(config['train']['imagine_batch_size'], self.device)
-        indices = self.autoencoder.encode_indices(batch['states'], batch['messages_in'])
+        indices = self.autoencoder.encode_indices(batch['states'], batch['beliefs'])
         size = indices.shape[0]
 
-        obs_seq, msg_seq, sample_seq, logp_seq = [], [], [], []
+        # The command and the recurrent belief the policy held at the replayed
+        # state; from there it carries both forward itself, so the world model
+        # never has to predict either.
+        prev_action = batch['prev_actions']
+        hidden = batch['hidden'].reshape(size * n_agents, -1)
+
+        obs_seq, belief_seq, prev_seq, hidden_seq = [], [], [], []
+        sample_seq, logp_seq = [], []
         state_seq, value_seq, reward_seq, continue_seq = [], [], [], []
 
         for _ in range(horizon):
-            hat_state, hat_obs, hat_msg = self.autoencoder.decode_indices(indices)
+            hat_state, hat_obs, hat_belief = self.autoencoder.decode_indices(indices)
 
             flat_obs = hat_obs.reshape(size * n_agents, -1)
-            flat_msg = hat_msg.reshape(size * n_agents, -1)
-            action, emission, log_prob, sample = policy.actor(flat_obs, flat_msg)
+            flat_belief = hat_belief.reshape(size * n_agents, -1)
+            flat_prev = prev_action.reshape(size * n_agents, -1)
 
-            action = action.view(size, n_agents, -1).clamp(-1.0, 1.0)
-            emission = emission.view(size, n_agents, -1)
+            features = policy.features(flat_obs, flat_belief)
+            sample, log_prob, next_hidden = policy.actor(features, flat_prev, hidden)
+            action = sample.view(size, n_agents, -1).clamp(-1.0, 1.0)
 
             reward, done_prob = self.reward_model.predict(indices, action)
 
             obs_seq.append(flat_obs)
-            msg_seq.append(flat_msg)
+            belief_seq.append(flat_belief)
+            prev_seq.append(flat_prev)
+            hidden_seq.append(hidden)
             sample_seq.append(sample)
             logp_seq.append(log_prob)
             state_seq.append(hat_state)
@@ -196,10 +210,12 @@ class WorldModelTrainer:
             reward_seq.append(reward)
             continue_seq.append(policy_config['gamma'] * (1.0 - done_prob))
 
+            prev_action = action
+            hidden = next_hidden
+
             indices = self.diffusion.sample(
                 context_indices=indices,
                 actions=action,
-                emissions=emission,
                 temperature=config['diffusion']['sample_temperature'],
             )
 
@@ -216,7 +232,9 @@ class WorldModelTrainer:
 
         rollout = {
             'obs': torch.cat(obs_seq, dim=0),
-            'messages': torch.cat(msg_seq, dim=0),
+            'beliefs': torch.cat(belief_seq, dim=0),
+            'prev_actions': torch.cat(prev_seq, dim=0),
+            'hidden': torch.cat(hidden_seq, dim=0),
             'samples': torch.cat(sample_seq, dim=0),
             'old_log_probs': torch.cat(logp_seq, dim=0),
             'advantages': repeat(advantages),

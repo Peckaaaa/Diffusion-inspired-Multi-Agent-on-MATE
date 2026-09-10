@@ -1,21 +1,50 @@
-"""End-to-end training entrypoint.
+"""Diffusion-driven trajectory planning on MATE: one pipeline, one learned module.
 
-Four stages per iteration:
+Every decision runs the same five stages, and only the third of them has weights:
 
-  1. act in the real MATE environment, fill the replay buffer
-  2. update the world model (FSQ tokenizer, categorical diffusion, reward/done)
-  3. imagine H steps through the categorical reverse process
-  4. update communicative MAPPO on the imagined trajectories
+    1  peer-to-peer round        each camera sends its target slots to the
+                                 neighbours inside `comm_range` and merges what
+                                 comes back into a belief          (MATEEnv)
+    2  belief                    merged slots plus, per slot, whether it is first
+                                 hand and how stale it is          (56 dims here)
+    3  trajectory flow           conditional flow matching samples where every
+                                 believed target goes over H steps (the only
+                                 trained component)                (FlowTrajectoryHead)
+    4  MPPI                      K candidate command sequences rolled through
+                                 MATE's exact camera optics, scored by soft
+                                 coverage of that sample, softmax-averaged
+                                 (MPPIPlanner)
+    5  intent                    the executed plan publishes what it means to
+                                 cover, so neighbours discount it next decision
 
-``src/envs/config_resolver.py`` imports ``mate`` from the MATE-main checkout it
-finds next to (or inside) the repository; ``MATE_ROOT`` overrides that search.
+There is no actor and no critic: the policy is the planner, recomputed from
+scratch every step.  The learning signal is dense and supervised -- true future
+target positions out of the global state, which is training-time information a
+camera never sees -- rather than a scalar team reward filtered through a policy
+gradient.
+
+A run writes everything a comparison needs to its own directory:
+
+    config.yaml     the resolved configuration, including the seed
+    metrics.jsonl   one line per iteration, written whether or not wandb is on
+    checkpoint.pt   the latest weights
+    best.pt         the weights at the best periodic evaluation
+    results.json    the final evaluation, over more episodes than the periodic one
+
+Nothing is resumed: runs are short, and a half-restored buffer would silently be
+a different experiment.
 
 Run:
-    python train.py --config src/configs/default.yaml --set train.device=cpu
+    python train.py --seed 1 --tag v1 --steps 50000 --device cuda
+    python train.py --seed 1 --tag smoke --steps 1000 --no-wandb --device cpu
+
+``src/envs/config_resolver.py`` imports ``mate`` from the MATE-main checkout it
+finds next to (or inside) the repository; ``MATE_ROOT`` overrides the search.
 """
 
 import argparse
 import copy
+import json
 import os
 import sys
 import time
@@ -28,14 +57,22 @@ import yaml
 # The packages live under src/; the entrypoints stay at the repository root.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
-from algorithms.communicative_mappo import CommunicativeMAPPO
-from algorithms.replay_buffer import ReplayBuffer
-from algorithms.world_model_trainer import WorldModelTrainer
+from algorithms.mppi_planner import MPPIPlanner
+from algorithms.planning_collector import PlanningCollector
+from algorithms.trajectory_buffer import TrajectoryBuffer
 from envs.mate_wrapper import MATEEnv
-from evaluate import evaluate_policy, weighted_mean
+from evaluate import evaluate_planner
+from models.trajectory import TrajectoryFlowLearner
+
+
+DEFAULT_CONFIG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'src', 'configs', 'default.yaml'
+)
+TERRAIN_SIZE = 1000.0
 
 
 # ------------------------------------------------------------------------ config
+
 
 def load_config(path, overrides=()):
     with open(path, 'r', encoding='utf-8') as handle:
@@ -53,18 +90,56 @@ def load_config(path, overrides=()):
             raise KeyError(f'Unknown config key {key!r}')
         node[leaf] = yaml.safe_load(raw)
 
+    return config
+
+
+def apply_arguments(config, args):
+    """Command-line arguments win over the file, and are recorded in the run."""
+
+    if args.seed is not None:
+        config['env']['seed'] = args.seed
+    if args.steps is not None:
+        config['train']['total_env_steps'] = args.steps
+    if args.device is not None:
+        config['train']['device'] = args.device
+    if args.wandb is not None:
+        config['train']['wandb'] = args.wandb
+
     if config['train']['device'] == 'auto':
         config['train']['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Pinned host memory is only meaningful for a device copy.
+    config['train']['pin_memory'] = (
+        config['train']['pin_memory'] and config['train']['device'].startswith('cuda')
+    )
+
+    if args.save_dir is not None:
+        config['train']['save_dir'] = args.save_dir
+    else:
+        # One directory per (tag, seed) so a grid never collides and an
+        # aggregation script can find every leaf by globbing.
+        config['train']['save_dir'] = os.path.join(
+            'runs', args.tag, f'seed{config["env"]["seed"]}'
+        )
+    config['train']['tag'] = args.tag
     return config
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--steps', type=int, default=None, help='override total_env_steps')
+    parser.add_argument('--device', type=str, default=None, help='cpu, cuda, cuda:0, auto')
+    parser.add_argument('--tag', type=str, default='main', help='groups a grid of runs')
+    parser.add_argument('--save-dir', type=str, default=None, help='overrides the run directory')
     parser.add_argument(
-        '--config',
-        type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'configs', 'default.yaml'),
+        '--final-episodes',
+        type=int,
+        default=50,
+        help='episodes in the end-of-run evaluation written to results.json',
     )
+    parser.add_argument('--wandb', dest='wandb', action='store_true', default=None)
+    parser.add_argument('--no-wandb', dest='wandb', action='store_false', default=None)
     parser.add_argument(
         '--set',
         dest='overrides',
@@ -76,247 +151,259 @@ def parse_args():
     return parser.parse_args()
 
 
-# --------------------------------------------------------------------- stage 1
+# ------------------------------------------------------------------------ logging
 
-class Collector:
-    """Steps the real environment and writes transitions to the buffer.
 
-    Keeps the running episode across calls so an iteration boundary does not
-    truncate an episode.
+class RunLogger:
+    """Prints a line, appends the same numbers to ``metrics.jsonl``, feeds wandb.
+
+    The file is what survives: a run that loses its terminal, or that was never
+    attached to wandb because the cluster has no outbound network, still leaves
+    every number it produced on disk.
     """
 
-    def __init__(self, env, policy, buffer):
-        self.env = env
-        self.policy = policy
-        self.buffer = buffer
-        self.current = env.reset()
-        self.episode_return = 0.0
-        self.episode_coverage = []
-        self.finished_episodes = []
+    def __init__(self, directory, config):
+        os.makedirs(directory, exist_ok=True)
+        self.path = os.path.join(directory, 'metrics.jsonl')
+        self.handle = open(self.path, 'a', encoding='utf-8')
+        self.wandb = None
 
-    def collect(self, num_steps, random_actions=False):
-        """Step until ``num_steps`` MATE steps have been consumed; returns that count.
+        if config['train']['wandb']:
+            import wandb
 
-        The budget is denominated in MATE steps, not decisions, so it stays
-        comparable across frame-skip settings.  One decision consumes up to
-        ``env.frame_skip`` of them.
-        """
-
-        n = self.env.n_agents
-        consumed = 0
-        while consumed < num_steps:
-            if random_actions:
-                actions = np.random.uniform(-1.0, 1.0, (n, self.env.action_dim)).astype(np.float32)
-                emissions = np.random.uniform(-1.0, 1.0, (n, self.env.msg_dim)).astype(np.float32)
-            else:
-                actions, emissions = self.policy.act_numpy(
-                    self.current['obs'], self.current['messages']
-                )
-
-            nxt, reward, done, info = self.env.step(actions, emissions)
-
-            self.buffer.add(
-                state=self.current['state'],
-                obs=self.current['obs'],
-                messages_in=self.current['messages'],
-                messages_out=emissions,
-                actions=actions,
-                reward=reward,
-                next_state=nxt['state'],
-                next_messages_in=nxt['messages'],
-                done=done,
+            self.wandb = wandb.init(
+                project='mate-diffusion-planning',
+                config=config,
+                group=config['train']['tag'],
+                name=f'seed{config["env"]["seed"]}',
+                dir=directory,
             )
 
-            consumed += info['env_steps']
-            self.episode_return += reward
-            # Weighted by MATE steps: the last decision of an episode can be cut
-            # short, and MATE's coverage rate is a mean over MATE steps.
-            self.episode_coverage.append((info['coverage_rate'], info['env_steps']))
-            self.current = nxt
+    def log(self, metrics, step):
+        self.handle.write(json.dumps(metrics) + '\n')
+        self.handle.flush()
+        if self.wandb is not None:
+            self.wandb.log(metrics, step=step)
 
-            if done:
-                self.finished_episodes.append(
-                    {
-                        'return': self.episode_return,
-                        'coverage_rate': weighted_mean(self.episode_coverage),
-                    }
-                )
-                self.episode_return = 0.0
-                self.episode_coverage = []
-                self.current = self.env.reset()
-
-        return consumed
-
-    def drain_stats(self):
-        if not self.finished_episodes:
-            return {}
-        stats = {
-            'env/episode_return': float(np.mean([e['return'] for e in self.finished_episodes])),
-            'env/coverage_rate': float(
-                np.mean([e['coverage_rate'] for e in self.finished_episodes])
+        print(
+            ' | '.join(
+                f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}'
+                for k, v in metrics.items()
             ),
-            'env/episodes': len(self.finished_episodes),
-        }
-        self.finished_episodes = []
-        return stats
+            flush=True,
+        )
+
+    def close(self):
+        self.handle.close()
+        if self.wandb is not None:
+            self.wandb.finish()
 
 
-# ------------------------------------------------------------------------ setup
+# -------------------------------------------------------------------------- setup
+
 
 def build_env(config, seed_offset=0):
     env_config = config['env']
     return MATEEnv(
         scenario=env_config['scenario'],
         max_episode_steps=env_config['max_episode_steps'],
-        msg_dim=env_config['msg_dim'],
         camera_comm=env_config['camera_comm'],
+        comm_range=env_config['comm_range'],
         reward_scale=env_config['reward_scale'],
         frame_skip=env_config['frame_skip'],
         seed=env_config['seed'] + seed_offset,
+        shared_fov=env_config['shared_fov'],
     )
 
 
 def env_spec(env):
     return {
         'n_agents': env.n_agents,
-        'state_dim': env.state_dim,
+        'n_targets': env.n_targets,
+        'belief_dim': env.belief_dim,
         'obs_dim': env.obs_dim,
-        'msg_dim': env.msg_dim,
+        'state_dim': env.state_dim,
         'action_dim': env.action_dim,
     }
 
 
-def build_policy(spec, config):
-    policy_config = config['policy']
-    return CommunicativeMAPPO(
-    obs_dim=spec['obs_dim'],
-    msg_dim=spec['msg_dim'],
-    action_dim=spec['action_dim'],
-    state_dim=spec['state_dim'],
-    hidden_dim=policy_config['hidden_dim'],
-    actor_lr=policy_config['actor_lr'],
-    critic_lr=policy_config['critic_lr'],
-    clip_ratio=policy_config['clip_ratio'],
-    entropy_coef=policy_config['entropy_coef'],
-    entropy_coef_min=policy_config['entropy_coef_min'],
-    entropy_decay_steps=policy_config['entropy_decay_steps'],
-    value_coef=policy_config['value_coef'],
-    max_grad_norm=policy_config['max_grad_norm'],
-    gamma=policy_config['gamma'],
-    lam=policy_config['lam'],
-    ppo_epochs=policy_config['ppo_epochs'],
-    num_minibatches=policy_config['num_minibatches'],
-    target_kl=policy_config['target_kl'],
-    device=config['train']['device'],
+def build_trajectory(spec, config):
+    trajectory_config = config['trajectory']
+    return TrajectoryFlowLearner(
+        belief_dim=spec['belief_dim'],
+        n_targets=spec['n_targets'],
+        horizon=trajectory_config['horizon'],
+        hidden_dim=trajectory_config['hidden_dim'],
+        displacement_scale=trajectory_config['displacement_scale'],
+        sample_steps=trajectory_config['sample_steps'],
+        lr=trajectory_config['lr'],
+        consensus_weight=trajectory_config['consensus_weight'],
+        max_grad_norm=trajectory_config['max_grad_norm'],
+        terrain_size=TERRAIN_SIZE,
+        device=config['train']['device'],
     )
 
 
+def build_planner(config, device=None):
+    planner_config = config['planner']
+    return MPPIPlanner(
+        horizon=config['trajectory']['horizon'],
+        samples=planner_config['samples'],
+        temperature=planner_config['temperature'],
+        noise_scale=planner_config['noise_scale'],
+        discount=planner_config['discount'],
+        range_softness=planner_config['range_softness'],
+        angle_softness=planner_config['angle_softness'],
+        intent_discount=planner_config['intent_discount'],
+        seed=config['env']['seed'],
+        device=device or config['train']['device'],
+    )
 
-# ------------------------------------------------------------------------- main
+
+# -------------------------------------------------------------------------- main
+
 
 def main():
     args = parse_args()
-    config = load_config(args.config, args.overrides)
-
+    config = apply_arguments(load_config(args.config, args.overrides), args)
     train_config = config['train']
-    torch.manual_seed(config['env']['seed'])
-    np.random.seed(config['env']['seed'])
-    os.makedirs(train_config['save_dir'], exist_ok=True)
+
+    seed = config['env']['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    directory = train_config['save_dir']
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, 'config.yaml'), 'w', encoding='utf-8') as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
 
     env = build_env(config)
     eval_env = build_env(config, seed_offset=10_000)
-    # Evaluation must normalize with the statistics the policy was trained under.
+    # Evaluation reads the same normalization statistics the run collected under.
     eval_env.obs_rms = env.obs_rms
     eval_env.state_rms = env.state_rms
 
     spec = env_spec(env)
-    world_model = WorldModelTrainer(spec, config, train_config['device'])
-    policy = build_policy(spec, config)
-    buffer = ReplayBuffer(
+    trajectory = build_trajectory(spec, config)
+    planner = build_planner(config)
+    eval_planner = build_planner(config)
+    buffer = TrajectoryBuffer(
         capacity=train_config['buffer_capacity'],
         n_agents=spec['n_agents'],
-        state_dim=spec['state_dim'],
-        obs_dim=spec['obs_dim'],
-        msg_dim=spec['msg_dim'],
-        action_dim=spec['action_dim'],
+        n_targets=spec['n_targets'],
+        belief_dim=spec['belief_dim'],
+        pin_memory=train_config['pin_memory'],
     )
-    collector = Collector(env, policy, buffer)
+    collector = PlanningCollector(
+        env, planner, trajectory, buffer, warmup_steps=train_config['warmup_steps']
+    )
 
-    logger = None
-    if train_config['wandb']:
-        import wandb
-
-        logger = wandb.init(project='categorical-diffusion-mate', config=config)
+    logger = RunLogger(directory, config)
 
     # The device is printed because `auto` falls back to CPU silently when the
     # installed torch has no CUDA build -- on a GPU server that is worth seeing.
     device_name = train_config['device']
     if device_name.startswith('cuda'):
         device_name += f' ({torch.cuda.get_device_name(torch.device(device_name))})'
-    print(
-        f'{env.describe()} | codebook {world_model.autoencoder.codebook_size} x '
-        f'{config["world_model"]["num_tokens"]} tokens | '
-        f'{config["diffusion"]["noise_type"]} diffusion, T={config["diffusion"]["num_steps"]}, '
-        f'{config["diffusion"]["sample_steps"]} sampling steps | device {device_name}'
-    )
 
-    env_steps = collector.collect(train_config['seed_steps'], random_actions=True)
+    print(env.describe(), flush=True)
+    print(
+        f'flow trajectory head, H={config["trajectory"]["horizon"]}, '
+        f'{config["trajectory"]["sample_steps"]} Euler steps | '
+        f'MPPI {config["planner"]["samples"]} candidates | '
+        f'seed {seed} | device {device_name} | pin_memory {train_config["pin_memory"]}',
+        flush=True,
+    )
+    print(f'run directory: {directory}', flush=True)
+
+    env_steps = 0
     iteration = 0
+    best_coverage = float('-inf')
+    horizon = config['trajectory']['horizon']
     start = time.time()
 
     while env_steps < train_config['total_env_steps']:
         iteration += 1
-
         env_steps += collector.collect(train_config['env_steps_per_iter'])
 
-        wm_metrics = defaultdict(float)
-        for _ in range(train_config['wm_updates_per_iter']):
-            step_metrics = world_model.update(
-                buffer, train_config['wm_batch_size'], total_env_steps=env_steps
+        trajectory_metrics = defaultdict(float)
+        updates = train_config['trajectory_updates_per_iter']
+        performed = 0
+        for _ in range(updates):
+            window = buffer.sample_windows(
+                train_config['trajectory_batch_size'], horizon, train_config['device']
             )
-            for key, value in step_metrics.items():
-                wm_metrics[key] += value / train_config['wm_updates_per_iter']
+            if window is None:
+                break
+            beliefs, future = window
+            for key, value in trajectory.update(beliefs, future).items():
+                trajectory_metrics[key] += value
+            performed += 1
+        for key in trajectory_metrics:
+            trajectory_metrics[key] /= max(performed, 1)
 
-        policy_metrics = defaultdict(float)
-        for _ in range(train_config['policy_updates_per_iter']):
-            rollout, imagine_stats = world_model.imagine(policy, buffer, config)
-            for key, value in {
-                **policy.update(rollout, total_env_steps=env_steps),
-                **imagine_stats
-                }.items():
-                policy_metrics[key] += value / train_config['policy_updates_per_iter']
-
+        elapsed = time.time() - start
         metrics = {
             'env_steps': env_steps,
             'iteration': iteration,
-            'sps': env_steps / (time.time() - start),
-            **wm_metrics,
-            **policy_metrics,
+            'system/sps': env_steps / max(elapsed, 1e-6),
+            'system/elapsed_hours': elapsed / 3600.0,
+            'system/buffer': len(buffer),
+            **trajectory_metrics,
             **collector.drain_stats(),
         }
 
         if iteration % train_config['eval_every'] == 0:
-            metrics.update(evaluate_policy(eval_env, policy, train_config['eval_episodes']))
-            torch.save(
-                {
-                    'world_model': world_model.state_dict(),
-                    'policy': policy.state_dict(),
-                    'obs_rms': env.obs_rms.state_dict(),
-                    'state_rms': env.state_rms.state_dict(),
-                    'config': copy.deepcopy(config),
-                },
-                os.path.join(train_config['save_dir'], 'checkpoint.pt'),
+            metrics.update(
+                evaluate_planner(
+                    eval_env, eval_planner, trajectory, train_config['eval_episodes']
+                )
             )
+            checkpoint = {
+                'env_steps': env_steps,
+                'trajectory': trajectory.state_dict(),
+                'obs_rms': env.obs_rms.state_dict(),
+                'state_rms': env.state_rms.state_dict(),
+                'config': copy.deepcopy(config),
+            }
+            torch.save(checkpoint, os.path.join(directory, 'checkpoint.pt'))
+            if metrics['eval/coverage_rate'] > best_coverage:
+                best_coverage = metrics['eval/coverage_rate']
+                torch.save(checkpoint, os.path.join(directory, 'best.pt'))
 
-        print(
-            ' | '.join(
-                f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}'
-                for k, v in metrics.items()
-            )
-        )
-        if logger is not None:
-            logger.log(metrics, step=env_steps)
+        logger.log(metrics, step=env_steps)
 
+    # The number the comparison is made on: more episodes than the periodic
+    # evaluation, so the standard error is small enough to separate conditions.
+    final = evaluate_planner(eval_env, eval_planner, trajectory, args.final_episodes)
+    results = {
+        'seed': seed,
+        'tag': train_config['tag'],
+        'scenario': config['env']['scenario'],
+        'env_steps': env_steps,
+        'episodes': args.final_episodes,
+        'coverage_rate': final['eval/coverage_rate'],
+        'coverage_rate_std': final['eval/coverage_rate_std'],
+        'episode_return': final['eval/episode_return'],
+        'believed_fraction': final['eval/believed_fraction'],
+        'best_periodic_coverage': best_coverage if best_coverage > float('-inf') else None,
+        'wall_clock_hours': (time.time() - start) / 3600.0,
+        'directory': directory,
+    }
+    with open(os.path.join(directory, 'results.json'), 'w', encoding='utf-8') as handle:
+        json.dump(results, handle, indent=2)
+
+    if logger.wandb is not None:
+        logger.wandb.summary.update(results)
+
+    print(
+        f'\nfinal: coverage {results["coverage_rate"]:.4f} '
+        f'+- {results["coverage_rate_std"]:.4f} over {args.final_episodes} episodes '
+        f'({env_steps} env steps, {results["wall_clock_hours"]:.2f} h)',
+        flush=True,
+    )
+
+    logger.close()
     env.close()
     eval_env.close()
 

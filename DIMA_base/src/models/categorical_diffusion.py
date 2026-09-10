@@ -74,7 +74,7 @@ class CategoricalDiffusion(nn.Module):
 
     # --------------------------------------------------------------------- loss
 
-    def loss(self, clean_indices, context_indices, actions, emissions):
+    def loss(self, clean_indices, context_indices, actions):
         """Variational cross-entropy on the reconstructed clean tokens.
 
         The absorbing chain only ever needs the masked positions predicted -- the
@@ -88,7 +88,7 @@ class CategoricalDiffusion(nn.Module):
         )
         noisy, corrupted = self.q_sample(clean_indices, timesteps)
 
-        logits = self.denoiser(noisy, timesteps, context_indices, actions, emissions)
+        logits = self.denoiser(noisy, timesteps, context_indices, actions)
         per_token = F.cross_entropy(
             logits.reshape(-1, self.num_classes), clean_indices.reshape(-1), reduction='none'
         ).view_as(clean_indices)
@@ -114,7 +114,7 @@ class CategoricalDiffusion(nn.Module):
     # ------------------------------------------------------------------ reverse
 
     @torch.no_grad()
-    def sample(self, context_indices, actions, emissions, sample_steps=None, temperature=1.0):
+    def sample(self, context_indices, actions, sample_steps=None, temperature=1.0):
         """Draw ``I_{t+1}^0`` starting from pure noise.  ``(B, T)`` out.
 
         ``absorbing``: MaskGIT-style confidence unmasking -- each round keeps the
@@ -130,7 +130,7 @@ class CategoricalDiffusion(nn.Module):
 
         def predict(noisy, tau_value):
             timesteps = torch.full((batch,), float(tau_value), device=device)
-            logits = self.denoiser(noisy, timesteps, context_indices, actions, emissions)
+            logits = self.denoiser(noisy, timesteps, context_indices, actions)
             if temperature <= 0:
                 probabilities = F.one_hot(logits.argmax(-1), self.num_classes).float()
             else:

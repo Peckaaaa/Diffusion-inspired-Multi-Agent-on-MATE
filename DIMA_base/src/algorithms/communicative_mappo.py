@@ -1,19 +1,39 @@
-"""Communicative MAPPO trained on imagined FSQ rollouts.
+"""MAPPO over the belief pipeline, trained on imagined or real rollouts.
 
-Decentralized actor ``pi(a, m | hat_o^i, hat_m^i)`` -- the message the camera will
-broadcast next is part of the sampled action, so it is trained by the same policy
-gradient as the rotation/zoom command.  Nothing else could train it: the world
-model's transition is a categorical sampling over FSQ codes, so no gradient flows
-back through imagination into a deterministic message head.
+The decentralized actor is ``pi(a | f^i, a_prev^i, h^i)`` where the feature it
+reads is everything the camera knows after the peer-to-peer round:
 
-Centralized critic ``V(hat_s)`` reads the global state decoded from the same FSQ
-code the actor's observation came from.
+    f_t^i = [ hat_o_t^i , b_t^i , hat_p_t^i ]
+
+its own observation, the belief it merged from its neighbours' target slots, and
+the short forward roll the trajectory head predicts from that belief.  The
+recurrent state ``h`` carries what none of those three hold: what the camera has
+been doing and seeing over the episode.
+
+Every one of those inputs is there because a measurement said the ones before it
+were not enough -- a stateless actor on a single observation explains 35% of the
+reference agent's commands, adding the previous command takes that to 85% on the
+states that agent visits but leaves an error of 1.3 (against an action variance
+of 0.446) on the states a cloned policy reaches itself.
+
+The trajectory head is trained by supervised regression against true future
+positions rather than by the policy gradient, and it is detached where it enters
+the actor: it is a perception module with its own signal, not a value-driven
+one.  The centralized critic ``V(hat_s)`` reads the global state decoded from
+the same FSQ code the actor's observation came from.
+
+The message a camera broadcasts is no longer part of its action.  It publishes
+its observed target slots, which is what makes the received block mergeable and
+the consensus term meaningful; a learned vector could carry as much information
+but nothing downstream could hold two cameras to a shared meaning.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.trajectory import TrajectoryLearner
 
 
 def mlp(sizes, activation=nn.SiLU):
@@ -26,23 +46,23 @@ def mlp(sizes, activation=nn.SiLU):
 
 
 class CommunicativeActor(nn.Module):
-    """Gaussian over ``[a_t^i, m_{t+1}^i]`` conditioned on ``(hat_o_t^i, hat_m_t^i)``."""
+    """Gaussian over the rotation/zoom command, given the belief the GRU carries."""
 
-    def __init__(self, obs_dim, msg_dim, action_dim, hidden_dim=256, init_log_std=-0.5):
+    def __init__(self, feature_dim, action_dim, hidden_dim=256, init_log_std=-0.5):
         super().__init__()
 
         self.action_dim = action_dim
-        self.msg_dim = msg_dim
-        self.output_dim = action_dim + msg_dim
 
         self.body = nn.Sequential(
-            nn.Linear(obs_dim + msg_dim, hidden_dim),
+            nn.Linear(feature_dim + action_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
-        self.mean = nn.Linear(hidden_dim, self.output_dim)
-        self.log_std = nn.Parameter(torch.full((self.output_dim,), float(init_log_std)))
+        self.memory = nn.GRUCell(hidden_dim, hidden_dim)
+        self.hidden_dim = hidden_dim
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.full((action_dim,), float(init_log_std)))
 
         nn.init.orthogonal_(self.mean.weight, gain=0.01)
         nn.init.zeros_(self.mean.bias)
@@ -64,24 +84,31 @@ class CommunicativeActor(nn.Module):
         """
         return self.log_std.clamp(*self.LOG_STD_BOUNDS).exp()
 
-    def distribution(self, obs, messages):
-        features = self.body(torch.cat([obs, messages], dim=-1))
+    def initial_state(self, batch_size, device=None):
+        """The belief a camera starts an episode with: nothing remembered."""
+
+        return torch.zeros(batch_size, self.hidden_dim, device=device or self.log_std.device)
+
+    def distribution(self, features, prev_actions, hidden):
+        """Returns ``(distribution, next_hidden)``; the caller carries the state."""
+
+        encoded = self.body(torch.cat([features, prev_actions], dim=-1))
+        hidden = self.memory(encoded, hidden)
         # tanh on the mean keeps the command inside the normalized action box the
         # env wrapper expects; the sample itself stays Gaussian, so the PPO
         # log-probability needs no change-of-variable correction.
-        mean = torch.tanh(self.mean(features))
+        mean = torch.tanh(self.mean(hidden))
         std = self.std().expand_as(mean)
-        return torch.distributions.Normal(mean, std)
+        return torch.distributions.Normal(mean, std), hidden
 
-    def forward(self, obs, messages, deterministic=False):
-        dist = self.distribution(obs, messages)
+    def forward(self, features, prev_actions, hidden, deterministic=False):
+        dist, hidden = self.distribution(features, prev_actions, hidden)
         sample = dist.mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(sample).sum(dim=-1)
-        action, message = torch.split(sample, [self.action_dim, self.msg_dim], dim=-1)
-        return action, message, log_prob, sample
+        return sample, log_prob, hidden
 
-    def evaluate(self, obs, messages, sample):
-        dist = self.distribution(obs, messages)
+    def evaluate(self, features, prev_actions, hidden, sample):
+        dist, _ = self.distribution(features, prev_actions, hidden)
         log_prob = dist.log_prob(sample).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return log_prob, entropy
@@ -99,21 +126,25 @@ class CentralizedCritic(nn.Module):
 
 
 class CommunicativeMAPPO:
-    """PPO-clip on imagined trajectories with generalized lambda-returns."""
+    """PPO-clip on the actor, supervised regression on the trajectory head."""
 
     def __init__(
         self,
         obs_dim,
-        msg_dim,
+        belief_dim,
         action_dim,
         state_dim,
+        n_targets,
+        trajectory_horizon=4,
+        consensus_weight=0.1,
+        trajectory_lr=3e-4,
         hidden_dim=256,
         actor_lr=3e-4,
         critic_lr=1e-3,
         clip_ratio=0.2,
-        entropy_coef=3e-3,          # Giá trị ban đầu (ví dụ 0.003)
-        entropy_coef_min=3e-4,      # Giá trị nhỏ nhất sau khi decay (ví dụ 0.0003)
-        entropy_decay_steps=100000, # Tổng số env steps thực hiện decay
+        entropy_coef=3e-3,
+        entropy_coef_min=3e-4,
+        entropy_decay_steps=100000,
         value_coef=0.5,
         max_grad_norm=0.5,
         gamma=0.99,
@@ -124,20 +155,38 @@ class CommunicativeMAPPO:
         device='cpu',
     ):
         self.device = torch.device(device)
-        self.actor = CommunicativeActor(obs_dim, msg_dim, action_dim, hidden_dim).to(self.device)
+        self.n_targets = n_targets
+        self.trajectory_horizon = trajectory_horizon
+        self.consensus_weight = consensus_weight
+
+        # The same head the planner uses, trained the same way; here it feeds
+        # the actor's features instead of a rollout score.
+        self.trajectory_learner = TrajectoryLearner(
+            belief_dim=belief_dim,
+            n_targets=n_targets,
+            horizon=trajectory_horizon,
+            hidden_dim=hidden_dim,
+            lr=trajectory_lr,
+            consensus_weight=consensus_weight,
+            max_grad_norm=max_grad_norm,
+            device=device,
+        )
+        self.trajectory = self.trajectory_learner.predictor
+
+        feature_dim = obs_dim + belief_dim + n_targets * trajectory_horizon * 2
+        self.actor = CommunicativeActor(feature_dim, action_dim, hidden_dim).to(self.device)
         self.critic = CentralizedCritic(state_dim, hidden_dim).to(self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
         self.clip_ratio = clip_ratio
-        
-        # --- Cấu hình Entropy Decay ---
+
         self.entropy_coef_init = entropy_coef
         self.entropy_coef_min = entropy_coef_min
         self.entropy_decay_steps = entropy_decay_steps
-        self.entropy_coef = entropy_coef  # Sẽ được cập nhật động theo step
-        
+        self.entropy_coef = entropy_coef
+
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
@@ -146,19 +195,33 @@ class CommunicativeMAPPO:
         self.num_minibatches = num_minibatches
         self.target_kl = target_kl
 
+    # ----------------------------------------------------------------- features
+
+    def features(self, obs, beliefs):
+        """``[hat_o, b, hat_p]`` for every camera, with the prediction detached.
+
+        Detached because the trajectory head answers to its own supervision: a
+        policy gradient reaching into it would let the actor trade prediction
+        accuracy for whatever the critic currently likes, and the consensus term
+        would then be pulling against the return.
+        """
+
+        with torch.no_grad():
+            predicted = self.trajectory(beliefs)
+        return torch.cat([obs, beliefs, predicted.flatten(start_dim=1)], dim=-1)
+
     # -------------------------------------------------------------- interaction
 
     @torch.no_grad()
-    def act_numpy(self, obs, messages, deterministic=False):
-        """``(n, obs_dim)``/``(n, msg_dim)`` numpy in -> numpy action and message out."""
+    def act_numpy(self, obs, beliefs, prev_actions, hidden, deterministic=False):
+        """``(n, *)`` numpy in -> action and the belief state to carry on."""
 
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        msg_t = torch.as_tensor(messages, dtype=torch.float32, device=self.device)
-        action, message, _, _ = self.actor(obs_t, msg_t, deterministic=deterministic)
-        return (
-            action.clamp(-1.0, 1.0).cpu().numpy(),
-            message.cpu().numpy(),
+        tensor = lambda x: torch.as_tensor(x, dtype=torch.float32, device=self.device)
+        features = self.features(tensor(obs), tensor(beliefs))
+        sample, _, hidden_t = self.actor(
+            features, tensor(prev_actions), tensor(hidden), deterministic=deterministic
         )
+        return sample.clamp(-1.0, 1.0).cpu().numpy(), hidden_t.cpu().numpy()
 
     # ------------------------------------------------------------------ returns
 
@@ -181,12 +244,16 @@ class CommunicativeMAPPO:
             returns[t] = next_return
         return returns
 
+    # ------------------------------------------------------- trajectory head
+
+    def update_trajectory(self, beliefs, future_positions):
+        return self.trajectory_learner.update(beliefs, future_positions)
+
     # ------------------------------------------------------------------- update
 
     def update(self, batch, total_env_steps=0):
-        """PPO-clip update on a flattened imagined batch with Entropy Decay."""
+        """PPO-clip update on a flattened batch of imagined or real steps."""
 
-        # --- Tính toán entropy_coef động theo Linear Decay ---
         if self.entropy_decay_steps > 0:
             progress = min(1.0, total_env_steps / self.entropy_decay_steps)
             self.entropy_coef = self.entropy_coef_init - progress * (
@@ -194,7 +261,9 @@ class CommunicativeMAPPO:
             )
 
         obs = batch['obs']
-        messages = batch['messages']
+        beliefs = batch['beliefs']
+        prev_actions = batch['prev_actions']
+        hidden = batch['hidden']
         samples = batch['samples']
         old_log_probs = batch['old_log_probs']
         advantages = batch['advantages']
@@ -222,8 +291,12 @@ class CommunicativeMAPPO:
             for start in range(0, total, minibatch_size):
                 index = permutation[start : start + minibatch_size]
 
+                # Recomputed rather than stored: the trajectory head moves under
+                # the actor between rollout and update, and the feature the actor
+                # is scored on has to be the one it would read now.
+                features = self.features(obs[index], beliefs[index])
                 log_probs, entropy = self.actor.evaluate(
-                    obs[index], messages[index], samples[index]
+                    features, prev_actions[index], hidden[index], samples[index]
                 )
                 ratio = (log_probs - old_log_probs[index]).exp()
                 unclipped = ratio * advantages[index]
@@ -232,7 +305,6 @@ class CommunicativeMAPPO:
                 entropy_loss = -entropy.mean()
 
                 self.actor_optimizer.zero_grad(set_to_none=True)
-                # Sử dụng self.entropy_coef động tại đây
                 (policy_loss + self.entropy_coef * entropy_loss).backward()
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
@@ -285,6 +357,7 @@ class CommunicativeMAPPO:
         return {
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
+            'trajectory': self.trajectory_learner.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
         }
@@ -292,7 +365,6 @@ class CommunicativeMAPPO:
     def load_state_dict(self, d):
         self.actor.load_state_dict(d['actor'])
         self.critic.load_state_dict(d['critic'])
+        self.trajectory_learner.load_state_dict(d['trajectory'])
         self.actor_optimizer.load_state_dict(d['actor_optimizer'])
         self.critic_optimizer.load_state_dict(d['critic_optimizer'])
-
-    

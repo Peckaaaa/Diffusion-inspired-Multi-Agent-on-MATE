@@ -1,11 +1,26 @@
-"""MATE wrapper that produces the tuple the world model is trained on.
+"""MATE wrapper that runs the peer-to-peer channel and builds each camera's belief.
 
-One ``step`` yields ``(s_t, o_t^{1:n}, m_t^{in}, m_t^{emit}, a_t^{1:n}, r_t, s_{t+1}, done)``
-with continuous camera actions and MATE's own peer-to-peer camera messages.
-Only the camera team is controlled; the targets run MATE's ``GreedyTargetAgent``.
+One ``step`` yields ``(s_t, o_t^{1:n}, b_t^{1:n}, a_t^{1:n}, r_t, s_{t+1}, done)``
+with continuous camera actions.  Only the camera team is controlled; the targets
+run MATE's ``GreedyTargetAgent``.
 
-All entity counts and dimensions are read back from the scenario the resolver
-picked -- nothing here is hard-coded to a particular ``NC vs. NT`` setup.
+What travels on the channel is the sender's target-slot block -- the public state
+of every target it can currently see -- addressed to each neighbour in turn, not
+broadcast to the team.  That is the protocol MATE's own ``GreedyCameraAgent``
+implements by hand, and it is what makes a receiver able to merge: slot ``j`` is
+the same target for every camera, so a merge is a per-slot choice with no data
+association.  A learned message vector could carry the same information, but
+nothing downstream could then be held to a shared meaning -- the belief a camera
+publishes and the trajectory it predicts have to be comparable across cameras
+for the consensus term to say anything.
+
+The belief each camera ends a step with is that merge plus two columns the
+observation cannot provide: how many decisions have passed since anything
+refreshed the slot, and whether the camera saw it itself or was told.  Age is
+what lets a policy tell "seen just now" from "remembered from a while ago"; the
+first-hand bit is what keeps two cameras' beliefs distinguishable at all, since
+a fully connected team merges to the same union and would otherwise hold
+identical beliefs -- measured, and it drove the consensus term to exactly zero.
 
 ``MATE-main`` is a gymnasium port of MATE, so ``reset`` returns
 ``(observation, info)`` and ``step`` returns the five-tuple.
@@ -15,6 +30,14 @@ import numpy as np
 import torch
 
 from envs.config_resolver import ensure_mate_importable, resolve_scenario
+from envs.observation_fusion import (
+    camera_positions_from_state,
+    camera_target_slots,
+    fuse_camera_observations,
+    merge_slots,
+    target_positions_from_state,
+    target_slot_dim,
+)
 
 
 class RunningMeanStd:
@@ -74,16 +97,22 @@ class MATEEnv:
     rescaled to MATE's camera Box (``[-5, 5] x [-2.5, 2.5]``) here.
     """
 
+    #: Beyond this many decisions a stale slot is simply "old"; the counter
+    #: saturates so the policy sees a bounded input.
+    MAX_AGE = 25.0
+
     def __init__(
         self,
         scenario='MATE-4v8-9',
         max_episode_steps=200,
-        msg_dim=8,
         camera_comm=True,
+        comm_range=None,
         reward_scale=1.0,
         frame_skip=1,
         seed=0,
         normalize=True,
+        shared_fov=False,
+        update_statistics=True,
     ):
         ensure_mate_importable()
 
@@ -91,11 +120,18 @@ class MATEEnv:
         from mate.agents import GreedyTargetAgent
 
         self.scenario = resolve_scenario(scenario)
-        self.msg_dim = msg_dim
         self.camera_comm = camera_comm
+        # None means every teammate is a neighbour.  A finite range is measured
+        # between camera locations, which are fixed physical facts about the
+        # deployment rather than anything a camera has to perceive.
+        self.comm_range = comm_range
         self.reward_scale = reward_scale
         self.max_episode_steps = max_episode_steps
         self.frame_skip = int(frame_skip)
+        # Oracle fusion: every camera observes the union of the team's field of
+        # view.  Not a deployable setting -- it is the ceiling the peer-to-peer
+        # belief is measured against.
+        self.shared_fov = bool(shared_fov)
 
         # make_environment() instead of gym.make(): it builds MultiAgentTracking
         # directly, with no checker wrapper in front of MATE's
@@ -113,13 +149,29 @@ class MATEEnv:
         self.state_dim = unwrapped.state_space.shape[0]
         self.action_dim = unwrapped.camera_action_space.shape[0]
 
+        self.slot_dim = target_slot_dim()
+        #: What one camera puts on the wire: its target-slot block, and what its
+        #: current plan intends to cover.  The intent is what keeps four cameras
+        #: that share a belief from planning the same sweep -- coverage counts
+        #: distinct targets, and nothing in an independent score says so.
+        self.msg_dim = self.n_targets * (self.slot_dim + 1)
+        #: What it reads afterwards: the merged state, whether it is first
+        #: hand, how stale it is, and whether the slot is known at all.
+        self.belief_dim = self.n_targets * (self.slot_dim + 2)
+
         self.action_low = unwrapped.camera_action_space.low.astype(np.float64)
         self.action_high = unwrapped.camera_action_space.high.astype(np.float64)
 
         self.normalize = normalize
+        # Evaluation should read the distribution the policy was trained under.
+        # Folding evaluation rollouts back into the running statistics moves the
+        # scale of every observation the actor sees while it is being measured.
+        self.update_statistics = update_statistics
         self.obs_rms = RunningMeanStd((self.obs_dim,))
         self.state_rms = RunningMeanStd((self.state_dim,))
 
+        self.age = np.zeros((self.n_agents, self.n_targets), dtype=np.float64)
+        self.peer_intent = np.zeros((self.n_agents, self.n_targets), dtype=np.float64)
         self.episode_step = 0
         # MATE-main's wrapper.seed() still calls the RandomState-only randint on
         # gymnasium's Generator, so seeding goes through the first reset instead.
@@ -137,21 +189,33 @@ class MATEEnv:
         return (
             f'{self.scenario}: {self.n_agents} cameras, {self.n_targets} targets, '
             f'{self.n_obstacles} obstacles | state {self.state_dim}, obs {self.obs_dim}, '
-            f'action {self.action_dim}, msg {self.msg_dim}, frame skip {self.frame_skip}'
+            f'action {self.action_dim}, P2P payload {self.msg_dim}, belief {self.belief_dim}, '
+            f'frame skip {self.frame_skip}'
+            + (f', comm range {self.comm_range:.0f}' if self.comm_range else '')
+            + (' | shared field of view' if self.shared_fov else '')
+            + ('' if self.camera_comm else ' | channel off')
         )
 
     def _norm_obs(self, obs):
         obs = np.asarray(obs, dtype=np.float64).reshape(self.n_agents, self.obs_dim)
+        if self.shared_fov:
+            # Before normalization: the running statistics have to describe the
+            # observations the policy is actually handed.
+            obs = fuse_camera_observations(
+                obs, self.n_agents, self.n_targets, self.n_obstacles
+            )
         if not self.normalize:
             return obs.astype(np.float32)
-        self.obs_rms.update(obs)
+        if self.update_statistics:
+            self.obs_rms.update(obs)
         return self.obs_rms.normalize(obs)
 
     def _norm_state(self, state):
         state = np.asarray(state, dtype=np.float64).reshape(self.state_dim)
         if not self.normalize:
             return state.astype(np.float32)
-        self.state_rms.update(state[None])
+        if self.update_statistics:
+            self.state_rms.update(state[None])
         return self.state_rms.normalize(state)
 
     def _scale_action(self, actions):
@@ -161,37 +225,147 @@ class MATEEnv:
         actions = actions.reshape(self.n_agents, self.action_dim)
         return self.action_low + 0.5 * (actions + 1.0) * (self.action_high - self.action_low)
 
-    def _exchange_messages(self, messages):
-        """Broadcast each camera's message and return what every camera received.
+    def _neighbours(self):
+        """``(n_agents, n_agents)`` boolean: who is close enough to talk to whom."""
 
-        Routing -- and therefore any communication-range, delay or dropout
-        wrapper MATE has applied -- is done by the environment.  A camera's own
-        broadcast is excluded from its incoming set; the remainder is mean-pooled
-        so the received vector keeps a fixed ``msg_dim`` regardless of how many
-        peers were in range.
+        connected = ~np.eye(self.n_agents, dtype=bool)
+        if not self.comm_range:
+            return connected
+
+        positions = camera_positions_from_state(
+            self.env.unwrapped.state(), self.n_agents
+        )
+        distance = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1)
+        return connected & (distance <= self.comm_range)
+
+    def camera_states(self):
+        """``(n_agents, 9)`` raw private camera states, unnormalized.
+
+        Position, sight vector, viewing angle and the three constants a planner
+        needs to roll the optics forward.  Every entry is the camera's own,
+        so this is not privileged information.
         """
 
-        received = np.zeros((self.n_agents, self.msg_dim), dtype=np.float32)
+        ensure_mate_importable()
+        from mate import constants as consts
+
+        state = self.env.unwrapped.state()
+        offset = consts.PRESERVED_DIM
+        stride = consts.CAMERA_STATE_DIM_PRIVATE
+        return np.stack(
+            [state[offset + i * stride : offset + (i + 1) * stride] for i in range(self.n_agents)]
+        )
+
+    def _exchange_slots(self, raw_observation, intents):
+        """Run one peer-to-peer round and return what each camera received.
+
+        Every camera addresses its neighbours individually -- ``recipient=j``,
+        not a broadcast -- so routing, and therefore any communication-range,
+        delay or dropout wrapper MATE has applied, is done by the environment,
+        and the receiver knows which camera each block came from.
+        """
+
+        own = camera_target_slots(
+            raw_observation, self.n_agents, self.n_targets, self.n_obstacles
+        )
+        received = [[] for _ in range(self.n_agents)]
+        peer_intent = np.zeros((self.n_agents, self.n_targets))
         if not self.camera_comm:
-            return received
+            return own, received, peer_intent
 
         from mate.utils import Message, Team
 
-        messages = np.asarray(messages, dtype=np.float32).reshape(self.n_agents, self.msg_dim)
-        self.env.send_messages(
-            [
-                Message(sender=i, recipient=None, content=messages[i].copy(), team=Team.CAMERA)
-                for i in range(self.n_agents)
-            ]
-        )
+        connected = self._neighbours()
+        outgoing = []
+        for sender in range(self.n_agents):
+            payload = np.concatenate(
+                [own[sender].astype(np.float64).ravel(), intents[sender].astype(np.float64)]
+            )
+            for recipient in np.flatnonzero(connected[sender]):
+                outgoing.append(
+                    Message(
+                        sender=sender,
+                        recipient=int(recipient),
+                        content=payload.copy(),
+                        team=Team.CAMERA,
+                    )
+                )
+        self.env.send_messages(outgoing)
 
-        for i, inbox in enumerate(self.env.receive_messages()):
-            peer_contents = [
-                np.asarray(m.content, dtype=np.float32) for m in inbox if m.sender != i
-            ]
-            if peer_contents:
-                received[i] = np.mean(peer_contents, axis=0)
-        return received
+        slot_payload = self.n_targets * self.slot_dim
+        for index, inbox in enumerate(self.env.receive_messages()):
+            for message in inbox:
+                if message.sender == index:
+                    continue
+                content = np.asarray(message.content, dtype=np.float64)
+                received[index].append(
+                    content[:slot_payload].reshape(self.n_targets, self.slot_dim)
+                )
+                # A neighbour's claim is a lower bound on how covered a target
+                # already is; the strongest claim is the one worth avoiding.
+                peer_intent[index] = np.maximum(peer_intent[index], content[slot_payload:])
+        return own, received, peer_intent
+
+    def _belief(self, raw_observation, intents, reset=False):
+        """Merge the channel into a per-camera belief and age every slot."""
+
+        own, received, peer_intent = self._exchange_slots(raw_observation, intents)
+        self.peer_intent = peer_intent
+
+        if reset:
+            self.age[:] = 0.0
+
+        # Slot layout: [x, y, sight range, loaded, first hand, age, known].
+        # The known bit stays last so every consumer can find it the same way.
+        beliefs = np.zeros((self.n_agents, self.n_targets, self.slot_dim + 2))
+        for index in range(self.n_agents):
+            merged, first_hand = merge_slots(own[index], received[index])
+            known = merged[:, -1] > 0.0
+
+            self.age[index] = np.where(
+                known, 0.0, np.minimum(self.age[index] + 1.0, self.MAX_AGE)
+            )
+            beliefs[index, :, : self.slot_dim - 1] = merged[:, :-1]
+            beliefs[index, :, -3] = first_hand.astype(np.float64)
+            beliefs[index, :, -2] = self.age[index] / self.MAX_AGE
+            beliefs[index, :, -1] = merged[:, -1]
+
+        return self._scale_belief(beliefs)
+
+    def _zero_intents(self):
+        return np.zeros((self.n_agents, self.n_targets), dtype=np.float32)
+
+    def _scale_belief(self, beliefs):
+        """Fixed scaling, not running statistics.
+
+        A slot's mask and age are bounded by construction and its coordinates by
+        the terrain, so the scale is known in advance; running statistics would
+        drift with the policy and blur the difference between an empty slot and
+        a remembered one.
+        """
+
+        ensure_mate_importable()
+        from mate import constants as consts
+
+        scaled = np.array(beliefs, dtype=np.float32)
+        scaled[..., 0:2] /= consts.TERRAIN_SIZE          # location
+        scaled[..., 2] /= consts.TERRAIN_SIZE            # sight range
+        return scaled.reshape(self.n_agents, self.belief_dim)
+
+    def _target_positions(self):
+        """True target locations in belief coordinates.
+
+        Global state, so this is a training-time label for the trajectory head
+        and never part of what a camera knows.
+        """
+
+        ensure_mate_importable()
+        from mate import constants as consts
+
+        positions = target_positions_from_state(
+            self.env.unwrapped.state(), self.n_agents, self.n_targets
+        )
+        return (positions / consts.TERRAIN_SIZE).astype(np.float32)
 
     # ------------------------------------------------------------------- env API
 
@@ -202,36 +376,43 @@ class MATEEnv:
             self._pending_seed = None
         else:
             obs, _ = self.env.reset()
+
+        raw = np.asarray(obs, dtype=np.float64).reshape(self.n_agents, self.obs_dim)
+        if self.shared_fov:
+            raw = fuse_camera_observations(raw, self.n_agents, self.n_targets, self.n_obstacles)
+
+        belief = self._belief(raw, self._zero_intents(), reset=True)
         return {
             'state': self._norm_state(self.env.unwrapped.state()),
             'obs': self._norm_obs(obs),
-            'messages': np.zeros((self.n_agents, self.msg_dim), dtype=np.float32),
+            'belief': belief,
+            'peer_intent': self.peer_intent.astype(np.float32),
+            'camera_states': self.camera_states(),
+            'target_positions': self._target_positions(),
         }
 
-    def step(self, actions, messages=None):
-        """Exchange messages, then hold the action for ``frame_skip`` MATE steps.
+    def step(self, actions, intents=None):
+        """Hold the action for ``frame_skip`` MATE steps, then rebuild the belief.
 
-        The messages are exchanged once per decision, not once per MATE step: the
-        policy only gets to speak when it gets to act.  Every returned rate is the
-        mean over the MATE steps this decision actually consumed, so an episode
-        mean over decisions still equals the per-MATE-step mean when weighted by
-        ``info['env_steps']`` -- which is what MATE's coverage-rate metric is
-        defined over.
+        The peer-to-peer round runs once per decision, not once per MATE step:
+        the policy only gets to speak when it gets to act.  Every returned rate
+        is the mean over the MATE steps this decision actually consumed, so an
+        episode mean over decisions still equals the per-MATE-step mean when
+        weighted by ``info['env_steps']`` -- which is what MATE's coverage-rate
+        metric is defined over.
 
         Args:
             actions: ``(n_agents, action_dim)`` in ``[-1, 1]``.
-            messages: ``(n_agents, msg_dim)`` broadcast at this decision.
+            intents: ``(n_agents, n_targets)`` what each camera's plan means to
+                cover, published to its neighbours.  ``None`` publishes nothing,
+                which is what a policy without a plan has to say.
 
         Returns:
-            ``(next, reward, done, info)``.  ``next['messages']`` is what each
-            camera received -- the message input of the *next* decision, one
-            decision later, because a simultaneous exchange would be circular.
+            ``(next, reward, done, info)``.
         """
 
-        if messages is None:
-            messages = np.zeros((self.n_agents, self.msg_dim), dtype=np.float32)
-
-        received = self._exchange_messages(messages)
+        if intents is None:
+            intents = self._zero_intents()
         scaled = self._scale_action(actions)
 
         rates = {'coverage_rate': 0.0, 'real_coverage_rate': 0.0, 'mean_transport_rate': 0.0}
@@ -257,10 +438,18 @@ class MATEEnv:
         for key in rates:
             rates[key] /= consumed
 
+        raw = np.asarray(obs, dtype=np.float64).reshape(self.n_agents, self.obs_dim)
+        if self.shared_fov:
+            raw = fuse_camera_observations(raw, self.n_agents, self.n_targets, self.n_obstacles)
+
+        belief = self._belief(raw, intents)
         nxt = {
             'state': self._norm_state(self.env.unwrapped.state()),
             'obs': self._norm_obs(obs),
-            'messages': received,
+            'belief': belief,
+            'peer_intent': self.peer_intent.astype(np.float32),
+            'camera_states': self.camera_states(),
+            'target_positions': self._target_positions(),
         }
         info = dict(rates, env_steps=consumed)
         return nxt, rates['coverage_rate'] * self.reward_scale, done, info
